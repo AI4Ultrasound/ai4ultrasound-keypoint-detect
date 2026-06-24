@@ -9,10 +9,18 @@ import sys
 import os
 import glob
 import utils
+import re
 
 INPUT_RAW_DIR_PATH_DEFAULT='../../../Data/Group-001'
 OUTPUT_DIR_PATH_DEFAULT='../../../Data/Keypoint_Detect_Data'
 SITE_STR_DEFAULT=['CARVD','Lahey']
+BEFORE_DIURETIC_LABELS=['T0','Day_0']
+
+#Class ID numbers
+CLASS_ID_PLEURAL_LINE=1
+CLASS_ID_B_LINE=2
+
+
 if __name__ == '__main__':
     #Sets up command line args
     p=argparse.ArgumentParser(description='Convert Raw DCM and JSON files (organized per annotator per site) to desired repo format')
@@ -21,6 +29,7 @@ if __name__ == '__main__':
     p.add_argument('--output_dir',type=str,default=OUTPUT_DIR_PATH_DEFAULT,help='Path to base output directory') 
     p.add_argument('--site_str',type=list,default=SITE_STR_DEFAULT,help='List of US hospital sites to process')
     p.add_argument('--coordinate_space',type=str,default='both',help='Coordinate space to save images and annotations in. Options: both, scanline (rectangular), sector (original fan). both saves doubles of images and annotations for each coordinate')
+    p.add_argument('--before_diuretic_labels',type=list,default=BEFORE_DIURETIC_LABELS,help='Labels in dataset used to indicate that scan was taken before diuretic use.')
     #Parse command line args
     args=p.parse_args()
     input_dir=args.input_dir
@@ -28,6 +37,7 @@ if __name__ == '__main__':
     outdata_format=args.outdata_format
     site_str=args.site_str
     coordinate_space=args.coordinate_space
+    before_diuretic_labels=args.before_diuretic_labels
 
     #Check that input directory exists
     if not os.path.exists(input_dir):
@@ -78,7 +88,8 @@ if __name__ == '__main__':
                         utils.os_make_dir(output_dir_root)
 
                         #Annotations are stored in "annotations" subfolder as .json's and images in "images" subfolder as .png's
-                        #Each file has name based on: <annotator>_<site>_<patient_id>_<time>_<scan_id>_<frame_num>.<ext>
+                        #Each images file has name based on: <annotator>_<site>_<patient_id>_<time>_<scan_id>_<frame_num>.png
+                        #Each json file has name based on: <annotator>_<site>_<patient_id>_<time>_<scan_id>.json
                         output_dir_annotations=os.path.join(output_dir_root,'annotations')
                         output_dir_images=os.path.join(output_dir_root,'images')
                         utils.os_make_dir(output_dir_annotations)
@@ -92,18 +103,22 @@ if __name__ == '__main__':
                             utils.os_make_dir(os.path.join(output_dir_annotations,'scanline'))
                             utils.os_make_dir(os.path.join(output_dir_images,'scanline'))
 
-                        #Call export_clip_to_png which saves png's in output_dir_images and json annotations in output_dir_images
-                        #Do it for each the polar and cartesion space files
-                         
+                        #Call export_clip_to_png_and_json which saves png's in output_dir_images and json annotations in output_dir_images
+                        #Do it for each the sector and scanline space files
+                        #File name prefix is: <annotator>_<site>_<patient_id>_<time>_<scan_id>
+                        site_name=next((item for item in site_str if item in site),None)
+                        time_id='T0' if any(s in site for s in before_diuretic_labels) else 'T1'
+                        filename_prefix=f'{annotator}_{site_name}_{re.search(r'_(\d+)_', site).group(1)}_{time_id}_{os.path.splitext(dcm)[0]}'
+                        if coordinate_space=='both' or coordinate_space=='sector':
+                            utils.export_clip_to_png_and_json(dcm,json_file,os.path.join(output_dir_annotations,'sector'),
+                                                              os.path.join(output_dir_images,'sector'),filename_prefix,coordinate_space='sector',
+                                                              num_lines=128,num_samples_per_line=128)
+                        if coordinate_space=='both' or coordinate_space=='scanline':
+                            utils.export_clip_to_png_and_json(dcm,json_file,os.path.join(output_dir_annotations,'scanline'),
+                                                              os.path.join(output_dir_images,'scanline'),filename_prefix,coordinate_space='scanline',
+                                                              num_lines=128,num_samples_per_line=128)
 
-                        
-
-
-                        
-                        
-
-                        
-
+                        print("Converted Clip to annotations and image frames")          
 
 
                 print(f"Finished processing site: {site} for annotator: {annotator}")
