@@ -80,7 +80,7 @@ def export_clip_to_png_and_json(input_dicom_path: str,
                                 output_annotation_dir: str,
                                 output_image_dir: str,
                                 filename_prefix: str,
-                                file_metadata: dict={'site': None, 'patient_id': None, 'time': None,'probe_orient': None,'probe_type': None},
+                                file_metadata: dict={'site': None, 'patient_id': None, 'time': None},
                                 coordinate_space: str='scanline',
                                 num_lines: int=128,
                                 num_samples_per_line: int=128,
@@ -88,7 +88,7 @@ def export_clip_to_png_and_json(input_dicom_path: str,
     """ Converts a dicom clip (scan) and json annotation to individual images and annotations in the
       desired output format (only .png and .json supported now). 
       filename_prefix is a string with: <annotator>_<scan_id>
-      file_metadata is dict: {site, patient_id, time, probe_orient, probe_type}
+      file_metadata is dict: {site, patient_id, time}
       """
     
     
@@ -187,6 +187,12 @@ def export_clip_to_png_and_json(input_dicom_path: str,
         "images": [],
         "annotations": [],
     }
+    #Metadata contains: {site, patient_id, time, probe_orient, probe_type}
+    output_json["metadata"].append({
+        "site": file_metadata["site"],
+        "patient_id": file_metadata["patient_id"],
+        "time": file_metadata["time"],
+    })
 
 
     ann_id=0

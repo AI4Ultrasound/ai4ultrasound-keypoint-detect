@@ -110,6 +110,7 @@ if __name__ == '__main__':
                 #Extract 3-digit patient ID 
                 patient_id_match=re.search(r'_(\d+)_', site)
                 patient_id=patient_id_match.group(1) if patient_id_match else 'UNKNOWN'
+                metadata_dict={'site': site_name, 'patient_id': patient_id, 'time': time_id}
                
                 #Looping for all the dcm files (clips) in this site/annotator directory
                 for dcm in dcm_files:
@@ -125,8 +126,8 @@ if __name__ == '__main__':
                     dcm_stem=os.path.splitext(os.path.basename(dcm))[0]
                     if dcm_stem.lower().endswith('.dcm'):
                         dcm_stem=os.path.splitext(dcm_stem)[0]        
-
-                    filename_prefix=f'{annotator}_{site_name}_{patient_id}_{time_id}_{dcm_stem}'
+                    #<annotator>_<scan_id>
+                    filename_prefix=f'{annotator}_{dcm_stem}'
 
 
                     ######Converting JSON (with annotations) and DICOM to desired output format (e.g. COCO)######
