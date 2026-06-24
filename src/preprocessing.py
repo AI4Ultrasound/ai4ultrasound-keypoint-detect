@@ -16,9 +16,6 @@ OUTPUT_DIR_PATH_DEFAULT='../../../Data/Keypoint_Detect_Data'
 SITE_STR_DEFAULT=['CARVD','Lahey']
 BEFORE_DIURETIC_LABELS=['T0','Day_0']
 
-#Class ID numbers
-CLASS_ID_PLEURAL_LINE=1
-CLASS_ID_B_LINE=2
 
 
 if __name__ == '__main__':
@@ -27,9 +24,9 @@ if __name__ == '__main__':
     p.add_argument('--input_dir',type=str,default=INPUT_RAW_DIR_PATH_DEFAULT,help='Path to raw data base directory (directory containing separate annotators)')
     p.add_argument('--outdata_format',type=str,default='COCO_like',help='Format of output data for model training (e.g. "COCO_like" has an annotation and image subfolder in a COCO_Data root folder)') #Only supports COCO for now
     p.add_argument('--output_dir',type=str,default=OUTPUT_DIR_PATH_DEFAULT,help='Path to base output directory') 
-    p.add_argument('--site_str',type=list,default=SITE_STR_DEFAULT,help='List of US hospital sites to process')
+    p.add_argument('--site_str', type=str, nargs='+', default=SITE_STR_DEFAULT,help='One or more hospital-site substrings to match in folder names (e.g. --site_str CARVD Lahey).')
     p.add_argument('--coordinate_space',type=str,default='both',help='Coordinate space to save images and annotations in. Options: both, scanline (rectangular), sector (original fan). both saves doubles of images and annotations for each coordinate')
-    p.add_argument('--before_diuretic_labels',type=list,default=BEFORE_DIURETIC_LABELS,help='Labels in dataset used to indicate that scan was taken before diuretic use.')
+    p.add_argument('--before_diuretic_labels', type=str, nargs='+',default=BEFORE_DIURETIC_LABELS,help='Substrings in folder names that indicate a pre-diuretic (T0) scan (e.g. --before_diuretic_labels T0 Day_0).')
     #Parse command line args
     args=p.parse_args()
     input_dir=args.input_dir
@@ -39,6 +36,12 @@ if __name__ == '__main__':
     coordinate_space=args.coordinate_space
     before_diuretic_labels=args.before_diuretic_labels
 
+    #Check that coordinate_space is a correct string
+    if coordinate_space not in ('both', 'sector', 'scanline'):
+        print(f"ERROR: --coordinate_space must be 'both', 'sector', or 'scanline' "
+              f"— got '{coordinate_space}'.")
+        sys.exit(1)
+
     #Check that input directory exists
     if not os.path.exists(input_dir):
         print('Input directory: ' + input_dir + ' does not exist.')
@@ -46,8 +49,35 @@ if __name__ == '__main__':
     
     #Create the output directory if it does not exist
     utils.os_make_dir(output_dir)
+
+    ###################Create a shared output directory structure ONCE, outside all loops for efficiency###########
+    #Create directories once to make it more efficient
+    if outdata_format == 'COCO_like':
+        output_dir_root=os.path.join(output_dir,'COCO_Data')
+        utils.os_make_dir(output_dir_root)
+
+        #Annotations are stored in "annotations" subfolder as .json's and images in "images" subfolder as .png's
+        #Each images file has name based on: <annotator>_<site>_<patient_id>_<time>_<scan_id>_<frame_num>.png
+        #Each json file has name based on: <annotator>_<site>_<patient_id>_<time>_<scan_id>.json
+        output_dir_annotations=os.path.join(output_dir_root,'annotations')
+        output_dir_images=os.path.join(output_dir_root,'images')
+        utils.os_make_dir(output_dir_annotations)
+        utils.os_make_dir(output_dir_images)
+
+        #Create separate folders for sector (fan) or scanline (rectangular) under both annotations and images subfolders
+        if coordinate_space=='both' or coordinate_space=='sector':
+            utils.os_make_dir(os.path.join(output_dir_annotations,'sector'))
+            utils.os_make_dir(os.path.join(output_dir_images,'sector'))
+        if coordinate_space=='both' or coordinate_space=='scanline':
+            utils.os_make_dir(os.path.join(output_dir_annotations,'scanline'))
+            utils.os_make_dir(os.path.join(output_dir_images,'scanline'))
+    else:
+        print(f"ERROR: outdata_format '{outdata_format}' is not supported. "
+              f"Only 'COCO_like' is currently implemented.")
+        sys.exit(1)
+
     
-    #Loops through the annotators in the input directory and converts their data to the desired output format
+    #Loops (annotator => site => DICOM file) through the annotators in the input directory and converts their data to the desired output format
     for annotator in os.listdir(input_dir):
         annotator_path=os.path.join(input_dir,annotator)
         #Check that annotator path is a directory
@@ -58,6 +88,7 @@ if __name__ == '__main__':
         #Loops through the sites for this annotator 
         for site in os.listdir(annotator_path):
             if any(s in site for s in site_str):
+
                 site_path=os.path.join(annotator_path,site)
                 #Check that the site path is a directory
                 if not os.path.isdir(site_path):
@@ -65,11 +96,20 @@ if __name__ == '__main__':
                     continue
 
                 #Finds the dcm files in this site/annotator directory
-                dcm_files = sorted(glob.glob(os.path.join(site_path, '*.dcm'))) + \
+                dcm_files = (
+                            sorted(glob.glob(os.path.join(site_path, '*.dcm'))) +
                             sorted(glob.glob(os.path.join(site_path, '*.DCM')))
+                            )
                 if not dcm_files:
                     print(f"No DICOM files found in {site_path} skipping this site")
                     continue
+
+                #Pre-compute the filname components shared across all DICOMS in this site
+                site_name=next((s for s in site_str if s in site),"UNKNOWN")
+                time_id='T0' if any(s in site for s in before_diuretic_labels) else 'T1'
+                #Extract 3-digit patient ID 
+                patient_id_match=re.search(r'_(\d+)_', site)
+                patient_id=patient_id_match.group(1) if patient_id_match else 'UNKNOWN'
                
                 #Looping for all the dcm files (clips) in this site/annotator directory
                 for dcm in dcm_files:
@@ -81,34 +121,22 @@ if __name__ == '__main__':
                         continue
                     print(f"Found matching JSON: {os.path.basename(json_file)} for DICOM: {os.path.basename(dcm)}")
                     
+                    #Build the filename prefix:
+                    dcm_stem=os.path.splitext(os.path.basename(dcm))[0]
+                    if dcm_stem.lower().endswith('.dcm'):
+                        dcm_stem=os.path.splitext(dcm_stem)[0]        
+
+                    filename_prefix=f'{annotator}_{site_name}_{patient_id}_{time_id}_{dcm_stem}'
+
+
                     ######Converting JSON (with annotations) and DICOM to desired output format (e.g. COCO)######
                     #Select the output directory format
-                    if outdata_format=='COCO_like':
-                        output_dir_root=os.path.join(output_dir,'COCO_Data')
-                        utils.os_make_dir(output_dir_root)
-
-                        #Annotations are stored in "annotations" subfolder as .json's and images in "images" subfolder as .png's
-                        #Each images file has name based on: <annotator>_<site>_<patient_id>_<time>_<scan_id>_<frame_num>.png
-                        #Each json file has name based on: <annotator>_<site>_<patient_id>_<time>_<scan_id>.json
-                        output_dir_annotations=os.path.join(output_dir_root,'annotations')
-                        output_dir_images=os.path.join(output_dir_root,'images')
-                        utils.os_make_dir(output_dir_annotations)
-                        utils.os_make_dir(output_dir_images)
-
-                        #Create separate folders for sector (fan) or scanline (rectangular) under both annotations and images subfolders
-                        if coordinate_space=='both' or coordinate_space=='sector':
-                            utils.os_make_dir(os.path.join(output_dir_annotations,'sector'))
-                            utils.os_make_dir(os.path.join(output_dir_images,'sector'))
-                        if coordinate_space=='both' or coordinate_space=='scanline':
-                            utils.os_make_dir(os.path.join(output_dir_annotations,'scanline'))
-                            utils.os_make_dir(os.path.join(output_dir_images,'scanline'))
+                    try:                  
 
                         #Call export_clip_to_png_and_json which saves png's in output_dir_images and json annotations in output_dir_images
                         #Do it for each the sector and scanline space files
                         #File name prefix is: <annotator>_<site>_<patient_id>_<time>_<scan_id>
-                        site_name=next((item for item in site_str if item in site),None)
-                        time_id='T0' if any(s in site for s in before_diuretic_labels) else 'T1'
-                        filename_prefix=f'{annotator}_{site_name}_{re.search(r'_(\d+)_', site).group(1)}_{time_id}_{os.path.splitext(dcm)[0]}'
+                        
                         if coordinate_space=='both' or coordinate_space=='sector':
                             utils.export_clip_to_png_and_json(dcm,json_file,os.path.join(output_dir_annotations,'sector'),
                                                               os.path.join(output_dir_images,'sector'),filename_prefix,coordinate_space='sector',
@@ -118,10 +146,13 @@ if __name__ == '__main__':
                                                               os.path.join(output_dir_images,'scanline'),filename_prefix,coordinate_space='scanline',
                                                               num_lines=128,num_samples_per_line=128)
 
-                        print("Converted Clip to annotations and image frames")          
+                        print(f"Converted Clip '{os.path.basename(dcm)}' to annotations and image frames")
+                    except Exception as e:
+                        print(f" Error exporting '{os.path.basename(dcm)}': {e}")
 
 
-                print(f"Finished processing site: {site} for annotator: {annotator}")
+
+            print(f"Finished processing site: {site} for annotator: {annotator}")
                 
 
     

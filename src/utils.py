@@ -11,7 +11,10 @@ from scipy.ndimage import map_coordinates
 from dataclasses import dataclass
 import cv2
 from PIL import Image
-from preprocessing import (CLASS_ID_B_LINE, CLASS_ID_PLEURAL_LINE)
+
+#Class ID numbers
+CLASS_ID_PLEURAL_LINE=1
+CLASS_ID_B_LINE=2
 
 #These are data keys that are needed for processing
 REQUIRED_SCAN_KEYS = (
@@ -26,10 +29,14 @@ REQUIRED_SCAN_KEYS = (
 )
 
 
+
+
 ########################File Handling Functions#########################
 
 def find_json_for_dicom(dicom_path: str, json_dir: str) -> Optional[str]:
     """Match DICOM to JSON by SOPInstanceUID when possible, else by filename stem."""
+    
+    #Strategy 1: Read DICOM Header and compare the UID against the SOPInstanceUID field stored in each JSON
     ds = None
     try:
         ds = pydicom.dcmread(dicom_path, stop_before_pixels=True, force=True)
@@ -46,11 +53,16 @@ def find_json_for_dicom(dicom_path: str, json_dir: str) -> Optional[str]:
             if str(data.get("SOPInstanceUID", "")) == uid:
                 return p
 
+    #Strategy 2: filename-stem match
     stem = os.path.splitext(os.path.basename(dicom_path))[0]  # Filename without extension
+    if stem.lower().endswith('.dcm'):                           # strip second '.dcm' if it exists
+        stem = os.path.splitext(stem)[0]
+
     candidates = sorted(glob.glob(os.path.join(json_dir, f"{stem}*.json")))
     if candidates:
         return candidates[0]
 
+    #Strategy 3: Any JSON whose filename contains the stem
     for p in sorted(glob.glob(os.path.join(json_dir, "*.json"))):
         p_name = os.path.basename(p)
         p_stem = os.path.splitext(p_name)[0]
@@ -58,16 +70,31 @@ def find_json_for_dicom(dicom_path: str, json_dir: str) -> Optional[str]:
             return p
     return None
 
-def os_make_dir(folder_path):
+def os_make_dir(folder_path: str) -> None:
     if not os.path.exists(folder_path):
         os.makedirs(folder_path, exist_ok=True)
 
 
-def export_clip_to_png_and_json(input_dicom_path,input_json_path,output_annotation_dir,output_image_dir,
-                       filename_prefix,coordinate_space='scanline',num_lines=128,num_samples_per_line=128):
+def export_clip_to_png_and_json(input_dicom_path: str,
+                                input_json_path: str,
+                                output_annotation_dir: str,
+                                output_image_dir: str,
+                                filename_prefix: str,
+                                file_metadata: dict={'site': None, 'patient_id': None, 'time': None,'probe_orient': None,'probe_type': None},
+                                coordinate_space: str='scanline',
+                                num_lines: int=128,
+                                num_samples_per_line: int=128,
+                                ) -> None:
     """ Converts a dicom clip (scan) and json annotation to individual images and annotations in the
       desired output format (only .png and .json supported now). 
-      filename_prefix is a string with: <annotator>_<site>_<patient_id>_<time>_<scan_id>"""
+      filename_prefix is a string with: <annotator>_<scan_id>
+      file_metadata is dict: {site, patient_id, time, probe_orient, probe_type}
+      """
+    
+    
+    #Validate coordinate space immediately 
+    if coordinate_space not in ('sector','scanline'):
+        raise ValueError(f"coordinate_space must be 'sector' or 'scanline', got '{coordinate_space}'.")
     
     #########Loading data and initializing parameters############
     json_data=load_annotation_json(input_json_path) #Loading json annotations
@@ -91,8 +118,15 @@ def export_clip_to_png_and_json(input_dicom_path,input_json_path,output_annotati
     ################Loading in the ultrasound images###############
     frames_sector, psx, psy, _ds = load_ultrasound_frames_from_dicom(input_dicom_path)
     
-    ###############Converting images (originally in sector) to scanlines (rectangular)#######
-    if coordinate_space=='scanline':
+    ###############Converting images and annotations to requested coordinate space#######
+    # After this block we have:
+    #   num_frames              – total frames to iterate over
+    #   frame_to_pleura_out     – {frame_num: (N,2) array} in output coordinate space
+    #   frame_to_blines_out     – {frame_num: [(N,2), ...]} in output coordinate space
+    # For scanline:  scan_hwc  – (N, H, W, C) numpy array of converted frames
+    # For sector:    frames_sector is used directly (after axis reordering at save time)
+
+    if coordinate_space=='scanline': #Coordinate space is scanline (rectangular)
         scan_tensor, scan_config = convert_to_scanlines(frames_sector, scan_params, num_lines=num_lines, num_samples_per_line=num_samples_per_line)
         if scan_tensor is None:
             raise ValueError("Empty frame array from DICOM.")
@@ -102,36 +136,65 @@ def export_clip_to_png_and_json(input_dicom_path,input_json_path,output_annotati
         num_frames = scan_hwc_scanline.shape[0]
 
         #Init the dictionary to hold the annotations in the scanline space
-        frame_to_pleura_scanline: Dict[int, np.ndarray] = {}
+        frame_to_pleura_out: Dict[int, np.ndarray] = {}
+        frame_to_bline_out: Dict[int,List[np.ndarray]]={}
 
         #Read in annotations in scanline space
         for fn, mm in frame_to_pleura_sector.items():
             if fn < 0 or fn >= num_frames:
                 continue
-            frame_to_pleura_scanline[fn] = pleura_points_curvilinear_mm_to_scanlines(mm, psx, psy, scan_config)
+            frame_to_pleura_out[fn] = pleura_points_curvilinear_mm_to_scanlines(mm, psx, psy, scan_config)
         
-        frame_to_bline_scanline: Dict[int, List[np.ndarray]] = {}
         for fn, mm_list in frame_to_blines_sector.items():
             if fn < 0 or fn >= num_frames:
                 continue
-            converted: List[np.ndarray] = []
-            for mm in mm_list:
-                if mm.size == 0:
-                    continue
-                converted.append(pleura_points_curvilinear_mm_to_scanlines(mm, psx, psy, scan_config))
+            converted: List[np.ndarray] = [pleura_points_curvilinear_mm_to_scanlines(mm, psx, psy, scan_config) for mm in mm_list if mm.size>0]
             if converted:
-                frame_to_bline_scanline[fn] = converted
-        
+                frame_to_bline_out[fn] = converted
+
+    else: #Coordinate space is 'sector'
+        num_frames=frames_sector.shape[0]
+
+        frame_to_pleura_out: Dict[int, np.ndarray] = {}
+        frame_to_bline_out: Dict[int,List[np.ndarray]]={}
+        for fn, mm in frame_to_pleura_sector.items():
+            if fn < 0 or fn >= num_frames:
+                continue
+            #Annotations must be in pixel space, so we divide by pixel spacing
+            pts_px = mm.astype(float).copy()
+            pts_px[:, 0] /= psx   # x  (column direction)
+            pts_px[:, 1] /= psy   # y  (row direction)
+            frame_to_pleura_out[fn] = pts_px
+        for fn, mm_list in frame_to_blines_sector.items():
+            if fn < 0 or fn >= num_frames:
+                continue
+            converted = []
+            for mm in mm_list:
+                if mm.size>0:
+                    #Convert annotations to pixel space, so divide by pixel spacing
+                    pts_px = mm.astype(float).copy()
+                    pts_px[:, 0] /= psx
+                    pts_px[:, 1] /= psy
+                    converted.append(pts_px)
+            if converted:
+                frame_to_bline_out[fn]=converted
+       
 
     #Looping through all the image frames in this clip and saves them to separate files
     lbl_filename=os.path.join(output_annotation_dir,f'{filename_prefix}.json')
     output_json={
+        "metadata":[],
         "images": [],
         "annotations": [],
     }
+
+
+    ann_id=0
     for f in range(num_frames):
         img_filename=os.path.join(output_image_dir,f'{filename_prefix}_{f}.png')
-        im=np.asarray(scan_hwc_scanline[f]) if coordinate_space=='scanline' else np.asarray(frames_sector[f])
+        #Get the frame as (H,W,C) so PIL can save it correctly
+        im=np.asarray(scan_hwc_scanline[f]) if coordinate_space=='scanline' else np.moveaxis(np.asarray(frames_sector[f]),0,-1) #This is in (H,W,C)
+        
 
         #Enforce image to be 0->255 format:
         if im.dtype == np.uint8:
@@ -149,32 +212,37 @@ def export_clip_to_png_and_json(input_dicom_path,input_json_path,output_annotati
 
         #Update the image in the json:
         output_json["images"].append({
-                    "id": f,
+                    "frame_num": f,
                     "file_name": str(img_filename),
                     "height": im.shape[0],
                     "width": im.shape[1],
+                    "px_mul_x": psx,
+                    "px_mul_y": psy,
                 })
 
         #Handling the annotations and image labels in the output_json file:
         #Handling pleural keypoint annotations
-        pleural_pts_s=frame_to_pleura_scanline.get(f) if coordinate_space=='scanline' else frame_to_pleura_sector.get(f)
-        for pts_pleural in pleural_pts_s:
-            if pts_pleural is not None and pts_pleural.size>0:
-                output_json["annotations"].append({
-                    "id": f, #Just the frame number
-                    "category_id": CLASS_ID_PLEURAL_LINE,
-                    "keypoints": [[pts_pleural[:,0],pts_pleural[:,1]]],
-                   })                
+        pleural_pts=frame_to_pleura_out.get(f)
+        if pleural_pts is not None and pleural_pts.size>0:
+            output_json["annotations"].append({
+                "id":ann_id, #Unique annotation ID via running counter
+                "frame_num": f,
+                "category_id": CLASS_ID_PLEURAL_LINE,
+                "keypoints": pleural_pts.tolist(),
+                })   
+            ann_id+=1             
 
         #Handling bline keypoint annotations
-        bline_pts=frame_to_bline_scanline.get(f,[]) if coordinate_space=='scanline' else frame_to_blines_sector.get(f,[])
-        for pts_b in bline_pts:
+        bline_pts_list=frame_to_bline_out.get(f,[]) 
+        for pts_b in bline_pts_list:
             if pts_b is not None and pts_b.size>0:
                 output_json["annotations"].append({
-                    "id": f, #Just the frame number
+                    "id": ann_id, #Just the frame number
+                    "frame_num": f,
                     "category_id": CLASS_ID_B_LINE,
-                    "keypoints": [[pts_b[:,0],pts_b[:,1]]],
+                    "keypoints": pts_b.tolist(),
                    })
+                ann_id+=1
         
     #Save the json to its annotation folder
     with open(lbl_filename,"w",encoding="utf-8") as file:
@@ -270,12 +338,12 @@ def parse_all_lines_from_annotation(
     b_ok: List[bool] = []
 
     for entry in frames:
+        if not isinstance(entry, dict):
+            raise ValueError("frame_annotations entries must be objects.")
         if "frame_number" not in entry:
             raise ValueError("frame_annotations entry missing 'frame_number'.")
         fn = int(entry["frame_number"])
         frame_numbers.append(fn)
-        if not isinstance(entry, dict):
-            raise ValueError("frame_annotations entries must be objects.")
 
         p_arr, p_valid = _first_polyline_mm_from_entry(
             entry, "pleura_lines", require_non_empty_line=require_non_empty_line
