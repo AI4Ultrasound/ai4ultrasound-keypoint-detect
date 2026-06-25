@@ -81,6 +81,7 @@ def export_clip_to_png_and_json(input_dicom_path: str,
                                 output_image_dir: str,
                                 filename_prefix: str,
                                 file_metadata: dict={'site': None, 'patient_id': None, 'time': None},
+                                site_str: str=None,
                                 coordinate_space: str='scanline',
                                 num_lines: int=128,
                                 num_samples_per_line: int=128,
@@ -91,6 +92,10 @@ def export_clip_to_png_and_json(input_dicom_path: str,
       file_metadata is dict: {site, patient_id, time}
       """
     
+    if file_metadata is None:
+        file_metadata={'site': None, 'patient_id': None, 'time': None}
+    if site_str is None:
+        raise ValueError(f"site_str must be passed to export_clip_to_png_and_json")
     
     #Validate coordinate space immediately 
     if coordinate_space not in ('sector','scanline'):
@@ -115,9 +120,9 @@ def export_clip_to_png_and_json(input_dicom_path: str,
             frame_to_blines_sector[int(fn)] = good
 
 
-    ################Loading in the ultrasound images###############
-    frames_sector, psx, psy, _ds = load_ultrasound_frames_from_dicom(input_dicom_path)
-    
+    ################Loading in the ultrasound images and getting metadata###############
+    frames_sector, psx, psy, ds = load_ultrasound_frames_from_dicom(input_dicom_path)
+    transducer_metadata=extract_transducer_metadata(ds,site_str=site_str)
     ###############Converting images and annotations to requested coordinate space#######
     # After this block we have:
     #   num_frames              – total frames to iterate over
@@ -192,6 +197,11 @@ def export_clip_to_png_and_json(input_dicom_path: str,
         "site": file_metadata["site"],
         "patient_id": file_metadata["patient_id"],
         "time": file_metadata["time"],
+        "transducer_type": transducer_metadata["transducer_type"],
+        "manufacturer_name": transducer_metadata["manufacturer_name"],
+        "zone_label": transducer_metadata["zone_label"],
+        "sampling_rate": transducer_metadata["sampling_rate"],
+
     })
 
 
@@ -396,6 +406,48 @@ def load_ultrasound_frames_from_dicom(
     pixel_spacing_y = float(spacing[1])
 
     return frames, pixel_spacing_x, pixel_spacing_y, ds
+def extract_transducer_metadata(ds: Any,site_str: str) -> Dict[str,Any]:
+    """
+    Extracts the probe metadata from a pydicom Dataset
+    Input:
+    ds: datastructure from the dcm file
+    site_str: the site from which we are getting data
+
+    Return dict with keys:
+    transducer_type
+    manufacturer_name
+    zone_label (in R1-4/L1-4 format)
+    sampling_rate (milliseconds/frame)
+    """
+    if site_str=='CARVD':
+        zone_label=str(getattr(ds,"SeriesDescription",None) or "").strip()
+        manufacturer_name=str(getattr(ds,"Manufacturer",None) or "").strip()
+        transducer_type=getattr(ds, "TransducerType", None)
+        transducer_type=str(transducer_type[0] if transducer_type else "").strip()
+        sampling_rate=str(getattr(ds,"FrameTime",None) or "").strip()
+
+    elif site_str=='Lahey':
+        zone_label=str(getattr(ds,"SeriesDescription",None) or "")
+        zone_label=zone_label.split()[-1] if zone_label.strip() else ""
+        manufacturer_name=str(getattr(ds,"Manufacturer",None) or "").strip()
+
+        transducer_type=str(getattr(ds,"ManufacturerModelName",None) or "").strip()
+        sampling_rate=str(getattr(ds,"FrameTime",None) or "").strip()
+    else:
+        # Safe fallback for any unrecognised site
+        transducer_type   = ""
+        manufacturer_name = ""
+        zone_label        = ""
+        sampling_rate     = ""
+    
+    return{
+        "transducer_type": transducer_type,
+        "manufacturer_name": manufacturer_name,
+        "zone_label": zone_label,
+        "sampling_rate": sampling_rate,
+    }
+
+
 
 def convert_to_scanlines(
     frames: np.ndarray,

@@ -32,7 +32,7 @@ if __name__ == '__main__':
     input_dir=args.input_dir
     output_dir=args.output_dir
     outdata_format=args.outdata_format
-    site_str=args.site_str
+    site_str_list=args.site_str
     coordinate_space=args.coordinate_space
     before_diuretic_labels=args.before_diuretic_labels
 
@@ -87,7 +87,7 @@ if __name__ == '__main__':
 
         #Loops through the sites for this annotator 
         for site in os.listdir(annotator_path):
-            if any(s in site for s in site_str):
+            if any(s in site for s in site_str_list):
 
                 site_path=os.path.join(annotator_path,site)
                 #Check that the site path is a directory
@@ -105,7 +105,7 @@ if __name__ == '__main__':
                     continue
 
                 #Pre-compute the filname components shared across all DICOMS in this site
-                site_name=next((s for s in site_str if s in site),"UNKNOWN")
+                site_name=next((s for s in site_str_list if s in site),"UNKNOWN")
                 time_id='T0' if any(s in site for s in before_diuretic_labels) else 'T1'
                 #Extract 3-digit patient ID 
                 patient_id_match=re.search(r'_(\d+)_', site)
@@ -136,24 +136,24 @@ if __name__ == '__main__':
 
                         #Call export_clip_to_png_and_json which saves png's in output_dir_images and json annotations in output_dir_images
                         #Do it for each the sector and scanline space files
-                        #File name prefix is: <annotator>_<site>_<patient_id>_<time>_<scan_id>
+                        #File name prefix is: <annotator>_<scan_id>
                         
                         if coordinate_space=='both' or coordinate_space=='sector':
                             utils.export_clip_to_png_and_json(dcm,json_file,os.path.join(output_dir_annotations,'sector'),
-                                                              os.path.join(output_dir_images,'sector'),filename_prefix,coordinate_space='sector',
+                                                              os.path.join(output_dir_images,'sector'),filename_prefix,file_metadata=metadata_dict,site_str=site_name,coordinate_space='sector',
                                                               num_lines=128,num_samples_per_line=128)
                         if coordinate_space=='both' or coordinate_space=='scanline':
                             utils.export_clip_to_png_and_json(dcm,json_file,os.path.join(output_dir_annotations,'scanline'),
-                                                              os.path.join(output_dir_images,'scanline'),filename_prefix,coordinate_space='scanline',
+                                                              os.path.join(output_dir_images,'scanline'),filename_prefix,file_metadata=metadata_dict,site_str=site_name,coordinate_space='scanline',
                                                               num_lines=128,num_samples_per_line=128)
 
                         print(f"Converted Clip '{os.path.basename(dcm)}' to annotations and image frames")
                     except Exception as e:
                         print(f" Error exporting '{os.path.basename(dcm)}': {e}")
 
+            if any(s in site for s in site_str_list):
 
-
-            print(f"Finished processing site: {site} for annotator: {annotator}")
+                print(f"Finished processing site: {site} for annotator: {annotator}")
                 
 
     
