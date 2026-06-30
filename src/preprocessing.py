@@ -11,6 +11,8 @@ import glob
 import utils
 import re
 
+import time #Used to calculate run-time
+
 INPUT_RAW_DIR_PATH_DEFAULT='../../../Data/Group-001'
 OUTPUT_DIR_PATH_DEFAULT='../../../Data/Keypoint_Detect_Data'
 SITE_STR_DEFAULT=['CARVD','Lahey']
@@ -35,6 +37,8 @@ if __name__ == '__main__':
     site_str_list=args.site_str
     coordinate_space=args.coordinate_space
     before_diuretic_labels=args.before_diuretic_labels
+
+    # start_time=time.perf_counter()
 
     #Check that coordinate_space is a correct string
     if coordinate_space not in ('both', 'sector', 'scanline'):
@@ -154,6 +158,9 @@ if __name__ == '__main__':
             if any(s in site for s in site_str_list):
 
                 print(f"Finished processing site: {site} for annotator: {annotator}")
+    # end_time=time.perf_counter()
+    # execution_time=end_time-start_time
+    # print(f"preprocessing.py runtime: {execution_time:.6f} seconds")
                 
 
     
