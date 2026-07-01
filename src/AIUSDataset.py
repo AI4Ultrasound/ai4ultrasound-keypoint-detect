@@ -9,18 +9,20 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data.dataset import Dataset
+import albumentations as A
 
 #Init constants
 from utils import CLASS_ID_B_LINE, CLASS_ID_PLEURAL_LINE
 _VALID_LINE_TYPES=frozenset({'bline','pleuraline','both'})
 _VALID_NORM_METHODS=frozenset({None,'basic','lin_perframe','lin_global','stand','clip+lin','stand+clip','zero_back'})
 _VALID_AUGMENTATIONS=frozenset({'medianblur','brightnesscontrast','gaussnoise'})
-_CASH_DIR_NAME='../usframecache' #Where we store the cashed, processed, us frames for quicker loading with __getitem__
+_VALID_MODE_TYPES=frozenset({'frame','clip'})
+_CASH_DIR_ROOT_NAME='../../../Data/usframecache' #Where we store the cashed, processed, us frames for quicker loading with __getitem__
 
 
 class AIUSDataset(Dataset):
-    def __init__(self,json_paths,device,us_framesize=None,line_type='both',normalize_method='basic',
-                 resampling_freq=None,convert_to_gray=True,img_augmentations=None):
+    def __init__(self,json_paths,us_framesize=None,line_type='both',normalize_method='basic',
+                 resampling_freq=None,convert_to_gray=True,img_augmentations=None,return_mode='frame'):
         """
         json_paths (list of str): paths to annotation files for each clip in this data split
         us_framesize (None or tuple): resize US frame to these dimensions, or None means no resizing
@@ -37,6 +39,11 @@ class AIUSDataset(Dataset):
         resampling_freq (None or int): Resampling frequency (samples/sec) if we want to downsample the ultrasound images
         convert_to_gray: Whether we convert the us images to gray
         img_augmentation (None or list of str): Implements on-the-fly augmentations to us images during __getitem__. Options include: 'medianblur','brightnesscontrast','gaussnoise'
+        return_mode (str): 
+            - 'frame' __getitem__ returns a single (C,H,W) image + its annotations
+            - 'clip' __getitem__ returns the full sequence for a clip (T,C,H,W) + all per-frame annotations. Used for RNN/temporal models. Clips have variable T
+            so use the collate_fn when constructing dataloader.
+
 
         Description: init method does the following operations in following order:
             1. Load in annotations from json_path
@@ -60,6 +67,11 @@ class AIUSDataset(Dataset):
             raise ValueError(f"normalize_method='{normalize_method}' is invalid. "
                 f"Valid options: {sorted(str(x) for x in _VALID_NORM_METHODS)}.")
         
+        #Validate the return mode
+        if return_mode not in _VALID_MODE_TYPES:
+            raise ValueError(f"return_mode='{return_mode}' is invalid. "
+                f"Valid options: {sorted(_VALID_MODE_TYPES)}.")
+        
         #Enforce augmentation methods to a list
         if img_augmentations is None:
             img_augmentations=[]
@@ -76,13 +88,15 @@ class AIUSDataset(Dataset):
         
         #Setup variables    
         self.json_paths=json_paths
-        self.device=torch.device(device) if isinstance(device,str) else device
+        #self.device=torch.device(device) if isinstance(device,str) else device
         self.us_framesize=us_framesize
         self.line_type=line_type
         self.normalize_method=normalize_method
         self.resampling_freq=resampling_freq
         self.convert_to_gray=convert_to_gray
         self.img_augmentations=img_augmentations
+        self.return_mode=return_mode
+        self.stats_for_normalization_gpu={} #This will hold stats as tensors that are used on the GPU for unormalization
 
         #Convert the line type to the class ID number
         if self.line_type=='bline':
@@ -107,6 +121,9 @@ class AIUSDataset(Dataset):
         #These are containers populated by _build_dataset
         self.sample_index: List[Dict]=[] #This is a flat list, one dict per included US frame
         self.norm_stats: Dict={} #Dataset-level normalization statistics
+
+        #Initialize the augmentation pipeline
+        self._aug_pipeline=self._build_augmentation_pipeline() #Sets up the augmentation pipeline
 
         self._build_dataset() #Run the full preprocessing pipeline
 
@@ -150,7 +167,7 @@ class AIUSDataset(Dataset):
             if needs_global_stats:
                 self.norm_stats=self._load_norm_stats_from_cache(clip_records[0]['json_path'])
                 if not self.norm_stats:
-                    #All .pt files are present, but the norm_stats file is deleted
+                    #All .npy files are present, but the norm_stats file is deleted
                     self.norm_stats=self._compute_global_stats(clip_records)
                     self._save_norm_stats_to_cache(clip_records[0]['json_path'])
         else:
@@ -166,13 +183,13 @@ class AIUSDataset(Dataset):
                         self._process_and_cache_clip(rec) #Processes the clip and caches it
                 else:
                     #First/full rebuild
-                    #sub-pass A: PNG => preprocessing => stats => save preprocessed frames to _raw.pt
+                    #sub-pass A: PNG => preprocessing => stats => save preprocessed frames to _raw.npy
                     self.norm_stats=self._stats_pass_and_cache_raw(clip_records)
 
                     #Save the norm_stats incase sub-pass A is interrupted
                     self._save_norm_stats_to_cache(clip_records[0]['json_path'])
                     
-                    #sub-pass B: _raw.pt -> normalize -> final .pt -> delete _raw.pt
+                    #sub-pass B: _raw.npy -> normalize -> final .npy -> delete _raw.npy
                     for rec in clip_records:
                         self._normalize_and_recache_clip(rec)
             else:
@@ -335,6 +352,8 @@ class AIUSDataset(Dataset):
             
         return img.astype(np.float32) 
     
+
+    ##########Statistics Handling Functions#########
     def _accumulate_stats(self,img,acc):
         #Flatten the image
         flat=img.ravel().astype(np.float32)
@@ -399,7 +418,7 @@ class AIUSDataset(Dataset):
             #Loop for each of the frames
             for entry in rec['frame_entries']:
                 fn=entry['frame_num']
-                raw_cache_path=os.path.join(cache_dir,f'frame_{fn:05d}_raw.pt') #Where we save the raw image before normalization
+                raw_cache_path=os.path.join(cache_dir,f'frame_{fn:05d}_raw.npy') #Where we save the raw image before normalization
 
                 #Load the US frame:
                 try:
@@ -412,7 +431,7 @@ class AIUSDataset(Dataset):
                 acc=self._accumulate_stats(img,acc)
 
                 #Save the unormlized frame to raw cache and release
-                self._array_to_tensor_and_save(img,raw_cache_path)
+                self._array_to_npy_and_save(img,raw_cache_path)
         
         if acc['count']==0: #Checks that we have more than 0 pixels
             raise ValueError("No pixels accumulated — check that all image files exist.")
@@ -424,7 +443,7 @@ class AIUSDataset(Dataset):
     
     def _normalize_and_recache_clip(self,record):
         """
-        sub-pass B: _raw.pt -> normalize -> final .pt -> delete _raw.pt
+        sub-pass B: _raw.npy -> normalize -> final .npy -> delete _raw.npy
         This is called a clip record
         No PNG reads — all data is read from the raw disk cache written by
         Sub-pass A.  Writes cache_config.json after processing the clip.
@@ -435,9 +454,9 @@ class AIUSDataset(Dataset):
 
         for entry in record['frame_entries']:
             fn=entry['frame_num']
-            raw_cache_path=os.path.join(cache_dir,f'frame_{fn:05d}_raw.pt')
+            raw_cache_path=os.path.join(cache_dir,f'frame_{fn:05d}_raw.npy')
 
-            cache_path=os.path.join(cache_dir, f'frame_{fn:05d}.pt') #Where we store the final ultrasound image
+            cache_path=os.path.join(cache_dir, f'frame_{fn:05d}.npy') #Where we store the final ultrasound image
 
             #Checks that the raw file exists:
             if not os.path.isfile(raw_cache_path):
@@ -446,12 +465,12 @@ class AIUSDataset(Dataset):
                 continue
 
             #Load the raw (un-normalized) tensor
-            raw_tensor=self._load_tensor(raw_cache_path)
+            raw_tensor=self._load_frame(raw_cache_path)
             if raw_tensor is None: #Check that exists
                 continue
             img_np=self._tensor_to_array(raw_tensor) #Gets it as a numpy image
             img_norm = self._normalize_frame(img_np) #Normalizes the US frame
-            self._array_to_tensor_and_save(img_norm, cache_path) #Saves tbe image
+            self._array_to_npy_and_save(img_norm, cache_path) #Saves tbe image
 
             #Remove the intermediate raw file
             os.remove(raw_cache_path)
@@ -487,7 +506,7 @@ class AIUSDataset(Dataset):
 
         if self.normalize_method == 'stand':
             mean_val, std_val = self.norm_stats['mean'], self.norm_stats['std']
-            if std < 1e-8:
+            if std_val < 1e-8:
                 return np.zeros_like(img)
             return ((img - mean_val) / std_val).astype(np.float32)
 
@@ -514,8 +533,565 @@ class AIUSDataset(Dataset):
 
         return img  # Unreachable after __init__
     
+    def cast_stat_dicts_to_tensor_and_device(self,device):
+        #This casts the dict used for unormalization to the device and converts to tensor
+
+        mean_val=self.norm_stats['mean'].copy()
+        std_val=self.norm_stats['std'].copy()
+        max_val=self.norm_stats['max'].copy()
+        min_val=self.norm_stats['min'].copy()
+
+        #Converts the values to tensors and casts to device
+        mean_val=torch.tensor(mean_val,dtype=torch.float32,device=device)
+        std_val=torch.tensor(std_val,dtype=torch.float32,device=device)
+        max_val=torch.tensor(max_val,dtype=torch.float32,device=device)
+        min_val=torch.tensor(min_val,dtype=torch.float32,device=device)
+
+        self.stats_for_normalization_gpu={
+            'mean':mean_val,
+            'std':std_val,
+            'max':max_val,
+            'min':min_val
+        }
     
+    def unnormalize_image(self,image_tensor,is_gpu=True,return_oncpu=False):
+        """
+        Unnormalizes the image applied during preprocessing to product a uint8 numpy array.
+        is_gpu: Whether we want to do processing on the gpu (image_tensor is always on the GPU). If true, should call cast_stats_to_tensor_and_device first to move the stats to the GPU.
+        return_oncpu: Whether to return the unnormalized image on the CPU (as a numpy array) or on the GPU (as a tensor)
+
+        Note: 'lin_perframe', the per-image min/max are not stored at dataset level. So not the exact pixel values are recovered.
+        Similarly, 'stand+clip' loses information because of clip.
+        Similarly, 'clip+lin' loses information because of clip.
+        """
+        if not is_gpu: #Run processing on the CPU
+            mean_val=self.norm_stats['mean']
+            std_val=self.norm_stats['std']
+            max_val=self.norm_stats['max']
+            min_val=self.norm_stats['min']
+            img=image_tensor.detach().cpu().float().numpy() #Move the image tensor to the CPU and convert to numpy array, and detach from the computation graph
+        else: #Run processing on the GPU
+            mean_val=self.stats_for_normalization_gpu['mean']
+            std_val=self.stats_for_normalization_gpu['std']
+            max_val=self.stats_for_normalization_gpu['max']
+            min_val=self.stats_for_normalization_gpu['min']
+            img=image_tensor.detach().float() #Keep the image tensor on the GPU, detach from the computaiton graph and convert to float
         
+        #Unnormalize image based on normalization method
+        img_unnorm=None
+        if self.normalize_method is None: #We did no normalization
+            img_unnorm=img
+        
+        elif self.normalize_method == 'basic':
+            img_unnorm=img*255.0
+        
+        elif self.normalize_method == 'lin_perframe': #Cannot recover original pixel values because we don't know original min/max for each frame
+            img_unnorm=img*255.0
+
+        elif self.normalize_method == 'lin_global':
+            img_unnorm=img*(max_val-min_val)+min_val
+        
+        elif self.normalize_method == 'stand':
+            img_unnorm=img*std_val+mean_val
+        
+        elif self.normalize_method == 'clip+lin': #Cannot recover original pixel values because clamp was applied previously
+            lo=mean_val-3.0*std_val
+            hi=mean_val+3.0*std_val
+            img_unnorm=img*(hi-lo)+lo
+
+        elif self.normalize_method == 'stand+clip': #Cannot recover original pixel values because clamp was applied previously
+            img_unnorm=img*std_val+mean_val
+        
+        elif self.normalize_method == 'zero_back':
+            img_unnorm=img*127.5+127.5
+        else:
+            img_unnorm=img
+        
+        #Clip the image to [0,255] and convert to uint8
+        if is_gpu: #Process on the GPU with torch
+            img_unnorm=torch.clamp(img_unnorm,0.0,255.0).to(torch.uint8) #Clamps the image to [0,255] and converts to uint8
+            #Remove channel dimension for display
+            if img_unnorm.ndim==4: #If we have clip dimension then (T,C,H,W)
+                if img_unnorm.shape[1]==1: #If we have a channel dimension of 1, remove it
+                    img_unnorm=img_unnorm.squeeze(1) #Remove channel dimension for display
+                else: #Colour image
+                    img_unnorm=img_unnorm.permute(0,2,3,1) #Move channel dimension to the end for display
+            elif img_unnorm.ndim==3:            
+                if img_unnorm.shape[0]==1: #If we have a channel dimension of 1, remove it
+                    img_unnorm=img_unnorm.squeeze(0) #Remove channel dimension for display
+                else: #Colour image
+                    img_unnorm=img_unnorm.permute(1,2,0) #Move channel dimension to the end for display
+            
+            if return_oncpu: #Case where processing on the GPU, but move the image to the CPU and convert to numpy array
+                img_unnorm=img_unnorm.detach().cpu().numpy() #Converts to cpu
+
+        else: #Process on the CPU with numpy
+            img_unnorm=np.clip(img_unnorm,0.0,255.0).astype(np.uint8) #Clamps the image to [0,255] and converts to uint8  
+            # Remove channel dimension for display
+            if img_unnorm.ndim == 4: # clip (T,C,H,W)
+                if img_unnorm.shape[1] == 1:
+                    img_unnorm = img_unnorm.squeeze(axis=1)          # (T, H, W)
+                else:
+                    img_unnorm = np.moveaxis(img_unnorm, 1, -1) # (T, H, W, C)
+            elif img_unnorm.ndim == 3: # Single image (C,H,W)
+                if img_unnorm.shape[0] == 1:
+                    img_unnorm = img_unnorm[0]                    # (H, W)
+                else:
+                    img_unnorm = np.moveaxis(img_unnorm, 0, -1)   # (H, W, C)      
+
+        
+        return img_unnorm
+        
+
+    
+    ###############Array Conversion Helpers################
+
+    def _array_to_npy_and_save(self,img,path):
+        """
+        Converts a (H,W) or (H,W,C) numpy array to correct dimensions (based on colour conversion) and saves it to path.
+        Works for un-normalized (_raw.npy) or normalized (.npy) images.  Saves as float32.
+        """
+        if self.convert_to_gray:
+            img_array=img[np.newaxis,:,:] #Add a channel dimension for grayscale (1,H,W)
+        else:
+            img_array=np.moveaxis(img,-1,0) #Move channel dimension to front for RGB (3,H,W)
+        
+        np.save(path,img_array.astype(np.float32)) #Save the image array as float32
+    
+    def _tensor_to_array(self, tensor):
+        """
+        Convert a (C, H, W) float32 tensor back to a (H, W) or (H, W, 3)
+        float32 numpy array for normalization or display.
+        """
+        if self.convert_to_gray:
+            return tensor.squeeze(0).numpy()          # (H, W)
+        else:
+            return tensor.permute(1, 2, 0).numpy()    # (H, W, 3)
+    
+    def _load_frame(self, path):
+        """
+        Load a cached .npy file from *path* as a torch tensor (C,H,W).
+        Returns None and prints a warning on failure.
+        """
+        try:
+            img_array = np.load(path)                        # (C, H, W) float32
+            return torch.from_numpy(img_array).clone()       # clone → tensor owns memory
+        except Exception as exc:
+            print(f"[AIUSDataset] Warning: could not load '{path}': {exc}")
+            return None
+    
+    ################Cache Interface Helpers################
+    def _get_cache_dir(self,json_path,stem):
+        """
+        Create per-clip cache directory with the following structure:
+        _USCACHE_ROOT/<coord_space>/<stem>/ 
+        Where <coord_space> is 'sector' or 'scanline' and <stem> is the base name of the json file (<annotator>_<clip_hash>) with annotations
+        """
+        annotation_dir=os.path.dirname(os.path.abspath(json_path)) #Gets the path of the json file
+        coord_space=os.path.basename(annotation_dir) #Gets the name of the directory, which is either 'sector' or 'scanline'
+        cache_dir=os.path.join(_CASH_DIR_ROOT_NAME,coord_space,stem) #Creates the cache directory path
+        os.makedirs(cache_dir,exist_ok=True) #Creates the cache directory if it doesn't exist
+        return cache_dir
+    
+    def _cache_is_valid(self,cache_dir):
+        """
+        Checks if the stored config matches the current configuration for the ultrasound cache, so that we don't need to
+        reload and preprocess the images if they are already cached with the same configuration.
+        """
+        cfg_path=os.path.join(cache_dir,'cache_config.json')
+        if not os.path.isfile(cfg_path):
+            return False
+        
+        try:
+            with open(cfg_path,'r') as fh:
+                return json.load(fh).get('hash') == self._cache_cfg_hash
+        except Exception:
+            return False
+        
+    def _write_cache_config(self,cache_dir):
+        """
+        Write the current config hash to the cache_dir/cache_config.json
+        """
+        cfg_path=os.path.join(cache_dir,'cache_config.json')
+        with open(cfg_path,'w') as fh:
+            json.dump({'hash': self._cache_cfg_hash},fh)
+    
+    def _all_caches_valid(self,clip_records):
+        """
+        Returns true only when every frame across all clips has a valid final cache .npy file.
+        """
+        for rec in clip_records:
+            cache_dir=self._get_cache_dir(rec['json_path'],rec['stem'])
+            if not self._cache_is_valid(cache_dir):
+                return False
+            for entry in rec['frame_entries']:
+                fn=entry['frame_num']
+                cache_path=os.path.join(cache_dir,f'frame_{fn:05d}.npy')
+                if not os.path.isfile(cache_path):
+                    return False
+        return True
+
+    def _process_and_cache_clip(self,record):
+        """
+        Cache missing frames for one clip. Used for:
+            - No global stats case (normalize_method not in global stats group), so we don't need to compute global stats
+            - Interrupted sub-pass B (norm_stats in cache, some frames are missing)
+        
+        Per-frame priority order:
+          1. frame_{fn:05d}.npy valid → skip.
+             Clean up any orphaned _raw.npy left by an interrupted Sub-pass B.
+          2. frame_{fn:05d}_raw.npy exists → load raw tensor → normalize →
+             save final .npy → delete _raw.npy.
+          3. Neither cached → load PNG → preprocess → normalize → save final .npy.
+
+        Writes cache_config.json if any frame was written.
+        """
+        cache_dir=self._get_cache_dir(record['json_path'],record['stem']) #Gets the cache directory for this clip
+        cache_valid=self._cache_is_valid(cache_dir) #Checks if the cache directory is valid
+        wrote_any=False #Boolean to check that we wrote some cache
+
+        for entry in record['frame_entries']:
+            fn=entry['frame_num']
+            cache_path=os.path.join(cache_dir,f'frame_{fn:05d}.npy') #Where we store the final ultrasound image
+            raw_cache_path=os.path.join(cache_dir,f'frame_{fn:05d}_raw.npy') #Where we save the raw image before normalization
+
+            #Priority 1: final .npy already cached
+            if cache_valid and os.path.isfile(cache_path):
+                #Clean up any orphaned _raw.npy left by an interrupted Sub-pass B
+                if os.path.isfile(raw_cache_path):
+                    os.remove(raw_cache_path)
+
+                continue #Skip to next frame
+
+            #Priority 2: un-normalized _raw.npy exists, so we can normalize now
+            if os.path.isfile(raw_cache_path):
+                raw_tensor=self._load_frame(raw_cache_path)
+                if raw_tensor is not None:
+                    img_np=self._tensor_to_array(raw_tensor) #Gets it as a numpy image
+                    img_norm=self._normalize_frame(img_np) #Normalizes the US frame
+                    self._array_to_npy_and_save(img_norm,cache_path) #Saves the image
+                    os.remove(raw_cache_path) #Remove the intermediate raw file
+                    wrote_any=True
+                    continue
+            
+            #Priority 3: neither cached, so we load from original PNG
+            try:
+                img=self._load_and_preprocess_frame(entry['file_name']) #Load the US frame and preprocess it
+            except FileNotFoundError as exc:
+                print(f"[AIUSDataset] Warning: {exc} — skipping frame.")
+                continue
+
+            img_norm=self._normalize_frame(img) #Normalizes the US frame
+            self._array_to_npy_and_save(img_norm,cache_path) #Saves the image
+            wrote_any=True
+
+        if wrote_any:
+            self._write_cache_config(cache_dir) #Write the cache configuration file
+    
+
+    def _index_clip(self,record):
+        """
+        Append entries to the self.sample_index list
+        mode='frame' => One entry per annotated frame
+        mode='clip' => one entry per clip with all frames and annotations
+        """
+        cache_dir=self._get_cache_dir(record['json_path'],record['stem']) #Gets the cache directory for this clip
+
+        if self.return_mode=='frame':
+            #Frame level, so we append individual entries for each frame in the clip
+
+            #Loops for all the entries (frames) in the clip
+            for entry in record['frame_entries']:
+                fn=entry['frame_num']
+                cache_path=os.path.join(cache_dir,f'frame_{fn:05d}.npy') #Where we store the final ultrasound image
+                if not os.path.isfile(cache_path):
+                    continue
+                
+                keypoints  = [
+                    np.array(a['keypoints'], dtype=np.float32)
+                    for a in entry['annotations']
+                ]
+                categories = [a['category_id'] for a in entry['annotations']]
+
+                self.sample_index.append({
+                    'cache_path':    cache_path,
+                    'keypoints':     keypoints,   # List[ndarray (N_i, 2)] — variable length
+                    'categories':    categories,  # List[int]
+                    'frame_num':     fn,
+                    'px_mul_x':      entry['px_mul_x'],
+                    'px_mul_y':      entry['px_mul_y'],
+                    'clip_id':       record['stem'],
+                    'clip_metadata': record['clip_metadata'],
+                })
+
+        else:
+            #clip level, so we collect all valid frames and append as a single entry to sample_index
+
+            #Init the lists to hold the per-frame data for this clip
+            clip_cache_paths = []
+            clip_keypoints   = []
+            clip_categories  = []
+            clip_frame_nums  = []
+            clip_px_mul_x    = []
+            clip_px_mul_y    = []
+
+            #Loop for each frame and append to accumulator lists
+            for entry in record['frame_entries']:
+                fn=entry['frame_num']
+                cache_path=os.path.join(cache_dir,f'frame_{fn:05d}.npy') #Where we store the final ultrasound image
+                if not os.path.isfile(cache_path):
+                    continue
+                keypoints  = [
+                    np.array(a['keypoints'], dtype=np.float32)
+                    for a in entry['annotations']
+                ]
+                categories = [a['category_id'] for a in entry['annotations']]
+
+                clip_cache_paths.append(cache_path)
+                clip_keypoints.append(keypoints)
+                clip_categories.append(categories)
+                clip_frame_nums.append(fn)
+                clip_px_mul_x.append(entry['px_mul_x'])
+                clip_px_mul_y.append(entry['px_mul_y'])
+
+            #Append the clip-level entry to sample_index
+            if not clip_cache_paths:
+                return #No valid frames for this clip
+            
+            #T=number of frames in clip
+            self.sample_index.append({
+            'cache_paths':   clip_cache_paths,   # List[str] length T
+            'keypoints':     clip_keypoints,     # List[List[ndarray]] (T, K_t, N_i, 2)
+            'categories':    clip_categories,    # List[List[int]] (T, K_t)
+            'frame_nums':    clip_frame_nums,    # List[int] length T
+            'px_mul_x':      clip_px_mul_x,      # List[float] length T
+            'px_mul_y':      clip_px_mul_y,      # List[float] length T
+            'clip_id':       record['stem'],
+            'clip_metadata': record['clip_metadata'],
+            })
+
+    
+    ##################Norm Stats Cache Helpers################
+    def _norm_stats_cache_path(self,json_path):
+        """
+        Returns the path for the dataset-level norm_stats JSON file.
+        Stored at: _CASH_DIR_ROOT_NAME/<coord_space>/norm_stats_<hash>.json
+        Where <coord_space> is 'sector' or 'scanline' and <hash> is the first 12 characters of the md5 hash of the current configuration.
+        """
+        annotation_dir=os.path.dirname(os.path.abspath(json_path)) #Gets the path of the json file
+        coord_space=os.path.basename(annotation_dir) #Gets the name of the subdirectory one level up, which is either 'sector' or 'scanline'
+        cache_dir=os.path.join(_CASH_DIR_ROOT_NAME,coord_space) #Creates the cache directory path
+        os.makedirs(cache_dir,exist_ok=True) #Creates the cache directory if it doesn't exist
+        return os.path.join(cache_dir,f'norm_stats_{self._cache_cfg_hash}.json')
+    
+    def _save_norm_stats_to_cache(self,json_path):
+        """
+        Saves the dataset-level norm_stats to a json file cache directory
+        """
+        norm_path=self._norm_stats_cache_path(json_path)
+        with open(norm_path, 'w', encoding='utf-8') as fh:
+            json.dump(self.norm_stats, fh, indent=2)
+    
+    def _load_norm_stats_from_cache(self,json_path):
+        """
+        Loads the dataset-level norm stats from the cached JSON file.
+        Rerturns {} if absent/unreadable, signalling to recompute the norm stats for this configuration
+        """
+        norm_path=self._norm_stats_cache_path(json_path)
+        if not os.path.isfile(norm_path):
+            return {}
+        
+        try:
+            with open(norm_path, 'r', encoding='utf-8') as fh:
+                return json.load(fh)
+        except Exception as exc:
+            print(f"[AIUSDataset] Warning: could not read norm_stats cache "
+                  f"'{norm_path}': {exc}")
+            return {}
+        
+        
+
+    
+
+    ####################Dataset Interface####################
+
+    def __len__(self):
+        return len(self.sample_index)
+    
+    def __getitem__(self, idx):
+        """
+        if return_mode=='frame' => returns a single frame dict with:
+            'image'      : FloatTensor (C, H, W)
+            'keypoints'  : list[FloatTensor (N_i, 2)]
+            'categories' : LongTensor (K,)
+            'frame_num'  : int
+            'px_mul_x'   : float
+            'px_mul_y'   : float
+            'clip_id'    : str
+            'metadata'   : dict
+
+        if return_mode=='clip' => returns a single clip dict with:
+            'images'     : FloatTensor (T, C, H, W)  — padded if using collate_fn
+            'keypoints'  : list[list[FloatTensor (N_i, 2)]]  — shape (T, K_t)
+            'categories' : list[LongTensor (K_t,)]  — one tensor per frame
+            'frame_nums' : list[int] length T
+            'px_mul_x'   : list[float] length T
+            'px_mul_y'   : list[float] length T
+            'clip_len'   : int  — actual (un-padded) number of frames T
+            'clip_id'    : str
+            'metadata'   : dict
+
+        T=number of frames in the clip, K_t=number of annotations in frame t, N_i=number of keypoints in annotation i
+        !!!!!!!!!!!!No tensors are on device, handle this in model trainer!!!!!!!!!!
+        """
+        if self.return_mode == 'frame':
+            return self._getitem_frame(idx)
+        else:
+            return self._getitem_clip(idx)
+        
+    
+    def _getitem_frame(self,idx):
+        """
+        Returns a single annotated frame
+        """
+        sample=self.sample_index[idx] #Gets the current sample
+
+        image=self._load_frame(sample['cache_path']) #Loads the image from cache
+
+        if image is None:
+            raise RuntimeError(
+            f"Could not load cached frame '{sample['cache_path']}'."
+            )
+
+        if self.img_augmentations:
+            image=self._apply_augmentations(image) #Applies augmentations to this image on the fly
+
+        kp_tensors = [
+        torch.tensor(kp, dtype=torch.float32)
+        for kp in sample['keypoints']
+        ]
+        cat_tensor = torch.tensor(
+            sample['categories'], dtype=torch.long)
+        #Returns the dictionary with the frame data
+        return {
+        'image':      image,
+        'keypoints':  kp_tensors,
+        'categories': cat_tensor,
+        'frame_num':  sample['frame_num'],
+        'px_mul_x':   sample['px_mul_x'],
+        'px_mul_y':   sample['px_mul_y'],
+        'clip_id':    sample['clip_id'],
+        'metadata':   sample['clip_metadata'],
+        }
+    
+    def _getitem_clip(self,idx):
+        """
+        Returns the full clip as (T,C,H,W) tensor + per-frame annotations
+        """
+        sample=self.sample_index[idx] #Gets the current sample
+
+        images=[]
+        for cache_path in sample['cache_paths']:
+            img=self._load_frame(cache_path) #Loads the image from cache
+            if img is None:
+                raise RuntimeError(
+                    f"Could not load cached frame '{cache_path}'."
+                )
+            if self.img_augmentations:
+                img=self._apply_augmentations(img) #Applies augmentations to this image on the fly
+            images.append(img)
+        
+        images=torch.stack(images,dim=0) #Stacks the images into a (T,C,H,W) tensor
+
+        kp_tensors = [
+            [torch.tensor(kp, dtype=torch.float32) for kp in frame_kps]
+            for frame_kps in sample['keypoints']
+        ]
+        cat_tensors = [
+            torch.tensor(frame_cats, dtype=torch.long)
+            for frame_cats in sample['categories']
+        ]
+
+        #Returns the dictionary with the clip data
+        return {
+            'images':     images,
+            'keypoints':  kp_tensors,
+            'categories': cat_tensors,
+            'frame_nums': sample['frame_nums'],
+            'px_mul_x':   sample['px_mul_x'],
+            'px_mul_y':   sample['px_mul_y'],
+            'clip_len':   len(images),
+            'clip_id':    sample['clip_id'],
+            'metadata':   sample['clip_metadata'],
+        }
+    
+    ################Augmentation Helperes#############
+    @property
+    def _aug_range(self):
+        """
+        Approximate value range of a normalised frame.
+        Used to scale augmentation intensities consistently across all
+        normalization methods.
+        """
+        if self.normalize_method is None: #Range of values is 0-255.0
+            return 255.0
+        if self.normalize_method in ('stand', 'stand+clip'):
+            return 6.0      # roughly [-3, +3]
+        if self.normalize_method == 'zero_back':
+            return 2.0      # [-1, +1]
+        if self.normalize_method in ('lin_perframe', 'lin_global','clip+lin','basic'):
+            return 1.0      # [0, 1]
+    
+
+    def _build_augmentation_pipeline(self):
+        """
+        Convert self.img_augmentations dict into a callable Albumentations Compose pipeline. Call once at the end of __init__
+        """
+        if not self.img_augmentations:
+            return None
+
+        aug_range=self._aug_range #Range of values for the normalized image
+        transforms: List[A.BasicTransform]=[] #Initialize the transform pipeline to an empty list
+
+        for aug in self.img_augmentations:
+            if aug=='medianblur':
+                transforms.append(A.MedianBlur(blur_limit=(3,5),p=1.0)) #Setup the median blur augmentation
+            elif aug=='brightnesscontrast':
+                transforms.append(
+                    A.RandomBrightnessContrast(
+                        contrast_limit=0.2,
+                        brightness_limit=0.1*aug_range,
+                        brightness_by_max=True,
+                        p=1.0,
+                    )
+                )
+            elif aug=='gaussianblur':
+                transforms.append(
+                    A.GaussNoise(
+                        var_limit=(0.0,(0.02*aug_range)**2),
+                        mean=0.0,
+                        per_channel=True,
+                        p=1.0,
+                    )
+                )
+            #Skip other options
+        
+        return A.Compose(transforms) if transforms else None
+    
+    def _apply_augmentations(self,image_tensor):
+        """
+        Applies the augmentation pipeline to a single (C,H,W) image tensor. Returns a (C,H,W) tensor.
+        """
+        if self._aug_pipeline is None:
+            return image_tensor #No augmentations to apply
+        
+        #Convert the tensor to a numpy array (H,W,C) for Albumentations
+        img_hwc=image_tensor.numpy().transpose(1,2,0)
+        img_aug=self._aug_pipeline(image=img_hwc)['image'] #Applies the augmentation pipeline to the image and extracts the image
+
+        img_aug_tensor=torch.from_numpy(np.ascontiguousarray(img_aug.transpose(2,0,1)))
+        
+        return img_aug_tensor
 
 
 
