@@ -692,7 +692,7 @@ class AIUSDataset(Dataset):
         """
         try:
             img_array = np.load(path)                        # (C, H, W) float32
-            return torch.tensor(img_array).clone()       # clone → tensor owns memory
+            return torch.tensor(img_array)       # clone → tensor owns memory
         except Exception as exc:
             print(f"[AIUSDataset] Warning: could not load '{path}': {exc}")
             return None

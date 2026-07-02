@@ -45,7 +45,7 @@ def datasplitter(dataset_root: str='../../../Data/Keypoint_Detect_Data',
     - outputdata_format (default is COCO_like, only one supported right now)
     - train_split, val_split, test_split => split ratio for each dataset
     - k_folds: None not doing kfold, else number of k_folds (int)
-    - euqal_prop_tags: list containing which metadata_tags we want to enforce to have an equal proportion of in each dataset split
+    - equal_prop_tags: list containing which metadata_tags we want to enforce to have an equal proportion of in each dataset split
     - metadata_tags:
         - site: ['All'] or list
         - annotator:['All'] or list
