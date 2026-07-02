@@ -587,4 +587,6 @@ def curvilinear_to_scanlines_coordinates(
 
     return points_scanlines
 
+
+
 #############################Dataclasses######################

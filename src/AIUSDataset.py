@@ -22,7 +22,7 @@ _CASH_DIR_ROOT_NAME='../../../Data/usframecache' #Where we store the cashed, pro
 
 class AIUSDataset(Dataset):
     def __init__(self,json_paths,us_framesize=None,line_type='both',normalize_method='basic',
-                 resampling_freq=None,convert_to_gray=True,img_augmentations=None,return_mode='frame'):
+                 resampling_freq=None,convert_to_gray=True,img_augmentations=None,aug_prob=0.1, return_mode='frame'):
         """
         json_paths (list of str): paths to annotation files for each clip in this data split
         us_framesize (None or tuple): resize US frame to these dimensions, or None means no resizing
@@ -33,12 +33,13 @@ class AIUSDataset(Dataset):
             - 'lin_perframe'= subtract each pixel by image minimum, multiple by 1/(max-min) range, so: (I-Imin)*(1/(Imax-Imin))
             - 'lin_global'= subtract each pixel by global imahe minimum, multiple by 1/(max-min) range, so: (I-IGlobalmin)*(1/(IGlobalmax-IGlobalmin))
             - 'stand'= subtract mean & divide by std
-            - 'clip+lin'= clip values higher/less than 0.995*min and 0.995*max (global min and max) then do lin_perframe
+            - 'clip+lin'= clip values higher/less than mean +/-3*std (global min and max) then do lin_perframe
             - 'stand+clip'=standardize, then clip values outside +-3*std
             - 'zero_back' = (I-127.5)/127.5 (ensures black background remains zero)
         resampling_freq (None or int): Resampling frequency (samples/sec) if we want to downsample the ultrasound images
         convert_to_gray: Whether we convert the us images to gray
         img_augmentation (None or list of str): Implements on-the-fly augmentations to us images during __getitem__. Options include: 'medianblur','brightnesscontrast','gaussnoise'
+        aug_prob (float): Probability that a particular frame (or clip) has the augmentation applied to it. Default is 0.1 = 10% of data will have augmentation applied.
         return_mode (str): 
             - 'frame' __getitem__ returns a single (C,H,W) image + its annotations
             - 'clip' __getitem__ returns the full sequence for a clip (T,C,H,W) + all per-frame annotations. Used for RNN/temporal models. Clips have variable T
@@ -71,6 +72,8 @@ class AIUSDataset(Dataset):
         if return_mode not in _VALID_MODE_TYPES:
             raise ValueError(f"return_mode='{return_mode}' is invalid. "
                 f"Valid options: {sorted(_VALID_MODE_TYPES)}.")
+        if not 0.0 <= aug_prob <= 1.0:
+            raise ValueError(f"aug_prob={aug_prob} must be in [0.0, 1.0].")
         
         #Enforce augmentation methods to a list
         if img_augmentations is None:
@@ -97,6 +100,7 @@ class AIUSDataset(Dataset):
         self.img_augmentations=img_augmentations
         self.return_mode=return_mode
         self.stats_for_normalization_gpu={} #This will hold stats as tensors that are used on the GPU for unormalization
+        self.aug_prob=aug_prob
 
         #Convert the line type to the class ID number
         if self.line_type=='bline':
@@ -238,8 +242,9 @@ class AIUSDataset(Dataset):
         
         #Extracts first dictionary of metadata (only one dict in metadata)
         clip_meta=meta_list[0]
+        raw_freq=clip_meta.get('sampling_rate')
         original_sampling_freq=float(clip_meta.get('sampling_rate')) #original sampling rate in (milliseconds/frame)
-        original_sampling_freq=1/(original_sampling_freq/1000) #original sampling rate in frames/second
+        original_sampling_freq = 1 / (float(raw_freq) / 1000) if raw_freq is not None else None #original sampling rate in frames/second
 
         #Build frame_num => image-info lookup
         images_by_frame: Dict[int,Dict] ={
@@ -364,6 +369,7 @@ class AIUSDataset(Dataset):
         acc['count']+=flat.size #Number of pixels per frame
         acc['min']=min(acc['min'],float(flat.min()))
         acc['max']=max(acc['max'],float(flat.max()))
+        return acc
     
     def _compute_stats_from_accumulator(self,acc):
         mean_val=acc['sum']/acc['count']
@@ -465,12 +471,12 @@ class AIUSDataset(Dataset):
                 continue
 
             #Load the raw (un-normalized) tensor
-            raw_tensor=self._load_frame(raw_cache_path)
-            if raw_tensor is None: #Check that exists
+            img_np=self._load_frame_np(raw_cache_path)
+            if img_np is None: #Check that exists
                 continue
-            img_np=self._tensor_to_array(raw_tensor) #Gets it as a numpy image
+            img_np=self._array_channelconvert(img_np) #Gets it as a numpy image
             img_norm = self._normalize_frame(img_np) #Normalizes the US frame
-            self._array_to_npy_and_save(img_norm, cache_path) #Saves tbe image
+            self._array_to_npy_and_save(img_norm, cache_path) #Saves the image
 
             #Remove the intermediate raw file
             os.remove(raw_cache_path)
@@ -489,7 +495,7 @@ class AIUSDataset(Dataset):
         if self.normalize_method == 'basic':
             return (img / 255.0).astype(np.float32) #Divide image by 255
 
-        #(I-Imin)*(255/(Imax-Imin))
+        #(I-Imin)/(Imax-Imin)
         if self.normalize_method == 'lin_perframe':
             imin, imax = float(img.min()), float(img.max())
             denom = imax - imin
@@ -536,10 +542,11 @@ class AIUSDataset(Dataset):
     def cast_stat_dicts_to_tensor_and_device(self,device):
         #This casts the dict used for unormalization to the device and converts to tensor
 
-        mean_val=self.norm_stats['mean'].copy()
-        std_val=self.norm_stats['std'].copy()
-        max_val=self.norm_stats['max'].copy()
-        min_val=self.norm_stats['min'].copy()
+        #Second number is default values in case that the norm_stats are empty
+        mean_val=self.norm_stats.get('mean',0.0)
+        std_val=self.norm_stats.get('std',1.0)
+        max_val=self.norm_stats.get('max',255.0)
+        min_val=self.norm_stats.get('min',0.0) 
 
         #Converts the values to tensors and casts to device
         mean_val=torch.tensor(mean_val,dtype=torch.float32,device=device)
@@ -668,14 +675,36 @@ class AIUSDataset(Dataset):
         else:
             return tensor.permute(1, 2, 0).numpy()    # (H, W, 3)
     
-    def _load_frame(self, path):
+    def _array_channelconvert(self, array):
+        """
+        Convert a (C, H, W) float32 tensor back to a (H, W) or (H, W, 3)
+        float32 numpy array for normalization or display.
+        """
+        if self.convert_to_gray:
+            return array.squeeze(0)          # (H, W)
+        else:
+            return np.moveaxis(array,0,-1)    # (H, W, 3)
+    
+    def _load_frame_tensor(self, path):
         """
         Load a cached .npy file from *path* as a torch tensor (C,H,W).
         Returns None and prints a warning on failure.
         """
         try:
             img_array = np.load(path)                        # (C, H, W) float32
-            return torch.from_numpy(img_array).clone()       # clone → tensor owns memory
+            return torch.tensor(img_array).clone()       # clone → tensor owns memory
+        except Exception as exc:
+            print(f"[AIUSDataset] Warning: could not load '{path}': {exc}")
+            return None
+    
+    def _load_frame_np(self,path):
+        """
+        Load a cached .npy file from *path* as a numpy tensor (C,H,W).
+        Returns None and prints a warning on failure.
+        """
+        try:
+            img_array = np.load(path)                        # (C, H, W) float32
+            return img_array.copy()       # Return image array
         except Exception as exc:
             print(f"[AIUSDataset] Warning: could not load '{path}': {exc}")
             return None
@@ -765,9 +794,9 @@ class AIUSDataset(Dataset):
 
             #Priority 2: un-normalized _raw.npy exists, so we can normalize now
             if os.path.isfile(raw_cache_path):
-                raw_tensor=self._load_frame(raw_cache_path)
-                if raw_tensor is not None:
-                    img_np=self._tensor_to_array(raw_tensor) #Gets it as a numpy image
+                img_np=self._load_frame_np(raw_cache_path)
+                if img_np is not None:
+                    img_np=self._array_channelconvert(img_np) #Gets it as a numpy image
                     img_norm=self._normalize_frame(img_np) #Normalizes the US frame
                     self._array_to_npy_and_save(img_norm,cache_path) #Saves the image
                     os.remove(raw_cache_path) #Remove the intermediate raw file
@@ -807,12 +836,14 @@ class AIUSDataset(Dataset):
                 if not os.path.isfile(cache_path):
                     continue
                 
+                #Store keypoints and categories as tensors for quicker extraction in _getitem_
                 keypoints  = [
-                    np.array(a['keypoints'], dtype=np.float32)
+                    torch.tensor(np.array(a['keypoints'], dtype=np.float32))
                     for a in entry['annotations']
                 ]
-                categories = [a['category_id'] for a in entry['annotations']]
+                categories = torch.tensor([a['category_id'] for a in entry['annotations']],dtype=torch.long) 
 
+                #Saves the results, sample_index is the main object that we call from in _getitem_
                 self.sample_index.append({
                     'cache_path':    cache_path,
                     'keypoints':     keypoints,   # List[ndarray (N_i, 2)] — variable length
@@ -842,10 +873,10 @@ class AIUSDataset(Dataset):
                 if not os.path.isfile(cache_path):
                     continue
                 keypoints  = [
-                    np.array(a['keypoints'], dtype=np.float32)
+                    torch.tensor(np.array(a['keypoints'], dtype=np.float32))
                     for a in entry['annotations']
                 ]
-                categories = [a['category_id'] for a in entry['annotations']]
+                categories = torch.tensor([a['category_id'] for a in entry['annotations']],dtype=torch.long)
 
                 clip_cache_paths.append(cache_path)
                 clip_keypoints.append(keypoints)
@@ -956,7 +987,7 @@ class AIUSDataset(Dataset):
         """
         sample=self.sample_index[idx] #Gets the current sample
 
-        image=self._load_frame(sample['cache_path']) #Loads the image from cache
+        image=self._load_frame_tensor(sample['cache_path']) #Loads the image from cache
 
         if image is None:
             raise RuntimeError(
@@ -966,17 +997,11 @@ class AIUSDataset(Dataset):
         if self.img_augmentations:
             image=self._apply_augmentations(image) #Applies augmentations to this image on the fly
 
-        kp_tensors = [
-        torch.tensor(kp, dtype=torch.float32)
-        for kp in sample['keypoints']
-        ]
-        cat_tensor = torch.tensor(
-            sample['categories'], dtype=torch.long)
         #Returns the dictionary with the frame data
         return {
         'image':      image,
-        'keypoints':  kp_tensors,
-        'categories': cat_tensor,
+        'keypoints':  sample['keypoints'],
+        'categories': sample['categories'],
         'frame_num':  sample['frame_num'],
         'px_mul_x':   sample['px_mul_x'],
         'px_mul_y':   sample['px_mul_y'],
@@ -991,32 +1016,25 @@ class AIUSDataset(Dataset):
         sample=self.sample_index[idx] #Gets the current sample
 
         images=[]
+        replay_params=None #Sample the augmentations once at the start of the clip, replay augmentation on rest of clip
         for cache_path in sample['cache_paths']:
-            img=self._load_frame(cache_path) #Loads the image from cache
+            img=self._load_frame_tensor(cache_path) #Loads the image from cache
             if img is None:
                 raise RuntimeError(
                     f"Could not load cached frame '{cache_path}'."
                 )
             if self.img_augmentations:
-                img=self._apply_augmentations(img) #Applies augmentations to this image on the fly
+                img,replay_params=self._apply_augmentations_cliplevel(img,replay_params) #Applies the augmentations at a clip level
+
             images.append(img)
         
         images=torch.stack(images,dim=0) #Stacks the images into a (T,C,H,W) tensor
 
-        kp_tensors = [
-            [torch.tensor(kp, dtype=torch.float32) for kp in frame_kps]
-            for frame_kps in sample['keypoints']
-        ]
-        cat_tensors = [
-            torch.tensor(frame_cats, dtype=torch.long)
-            for frame_cats in sample['categories']
-        ]
-
         #Returns the dictionary with the clip data
         return {
             'images':     images,
-            'keypoints':  kp_tensors,
-            'categories': cat_tensors,
+            'keypoints':  sample['keypoints'],
+            'categories': sample['categories'],
             'frame_nums': sample['frame_nums'],
             'px_mul_x':   sample['px_mul_x'],
             'px_mul_y':   sample['px_mul_y'],
@@ -1041,6 +1059,8 @@ class AIUSDataset(Dataset):
             return 2.0      # [-1, +1]
         if self.normalize_method in ('lin_perframe', 'lin_global','clip+lin','basic'):
             return 1.0      # [0, 1]
+        
+        return 1.0 #Fallback
     
 
     def _build_augmentation_pipeline(self):
@@ -1065,7 +1085,7 @@ class AIUSDataset(Dataset):
                         p=1.0,
                     )
                 )
-            elif aug=='gaussianblur':
+            elif aug=='gaussnoise':
                 transforms.append(
                     A.GaussNoise(
                         var_limit=(0.0,(0.02*aug_range)**2),
@@ -1076,7 +1096,12 @@ class AIUSDataset(Dataset):
                 )
             #Skip other options
         
-        return A.Compose(transforms) if transforms else None
+        #Here, p=probability that the augmentation will be applied to the frame or the clip
+        if self.return_mode=='clip':
+            #Return a replay compose object, so we can apply same augmentation across the clip if we are doing clip-level __getitem__
+            return A.ReplayCompose(transforms,p=self.aug_prob) if transforms else None
+        
+        return A.Compose(transforms,p=self.aug_prob) if transforms else None
     
     def _apply_augmentations(self,image_tensor):
         """
@@ -1086,12 +1111,34 @@ class AIUSDataset(Dataset):
             return image_tensor #No augmentations to apply
         
         #Convert the tensor to a numpy array (H,W,C) for Albumentations
-        img_hwc=image_tensor.numpy().transpose(1,2,0)
+        img_hwc=image_tensor.numpy().transpose(1,2,0) #(H,W,C)
         img_aug=self._aug_pipeline(image=img_hwc)['image'] #Applies the augmentation pipeline to the image and extracts the image
+        if img_aug.ndim==2: #If the image returned only has 2 dimensions (the channel dimension was dropped) add in an extra dimension at end
+            img_aug=img_aug[:,:,np.newaxis]
+        img_aug_tensor=torch.tensor(np.ascontiguousarray(img_aug.transpose(2,0,1)))
 
-        img_aug_tensor=torch.from_numpy(np.ascontiguousarray(img_aug.transpose(2,0,1)))
-        
         return img_aug_tensor
+    
+    def _apply_augmentations_cliplevel(self,img,replay_params):
+        #Applies augmentations to this image on the fly, but applies same augmentation across clip
+        if self._aug_pipeline is None:
+            return img #No augmentations to apply
+        
+        img_hwc=img.numpy().transpose(1,2,0)
+        if replay_params is None: #First frame of clip
+            result=self._aug_pipeline(image=img_hwc)
+            replay_params=result['replay'] #Gets the augmentation paramaters for this clip
+        else:
+            result=A.ReplayCompose.replay(replay_params,image=img_hwc)
+        img_aug=result['image']
+        #Add axis (channel) in case of grayscale image
+        if img_aug.ndim==2:
+            img_aug=img_aug[:,:,np.newaxis]
+        img=torch.tensor(np.ascontiguousarray(img_aug.transpose(2, 0, 1)))
+        
+        return img,replay_params
+    
+
 
 
 
