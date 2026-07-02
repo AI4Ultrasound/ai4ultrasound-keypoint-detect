@@ -4,6 +4,8 @@ datasplitter.py
 Splits a processed COCO-like keypoint-detection dataset into train / val / test
 lists of annotation JSON paths, with optional equal-proportion enforcement
 across one or two metadata tags, and optional k-fold cross-validation.
+
+todo: What string options for metadata tags
 """
 
 import glob

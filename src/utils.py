@@ -587,6 +587,76 @@ def curvilinear_to_scanlines_coordinates(
 
     return points_scanlines
 
+####################Clip Sequence Handling Functions#############
+def clip_collate_fn(clip_batch):
+    """
+    Collate function for when return_mode=='clip' in the AIUSDataset class.
+    This pads the end of the time dimension of all clips in the batch to the length of the longest clip. 
+    Pads using zeros, and returns a boolean padding mask.
+    
+    """
+    #Finds the longest clip length in this batch for padding
+    max_t=max(item['clip_len'] for item in clip_batch)
+    B=len(clip_batch) #Number of batches
+
+    #Get the shape of the first frame of the first clip
+    C,H,W=clip_batch[0]['images'].shape[1:]
+    device=clip_batch[0]['images'].device
+
+    #Allocate output tensors
+    images_padded=torch.zeros(B,max_t,C,H,W,dtype=torch.float32,device=device)
+    padding_mask=torch.zeros(B,max_t,dtype=torch.bool,device=device)
+
+    #Lists to hold the padded annotations and metadata
+    kp_padded  = []
+    cat_padded = []
+    clip_lens  = []
+    clip_ids   = []
+    metadata   = []
+    frame_nums = []
+    px_mul_x = []
+    px_mul_y = []
+
+
+    for b,item in enumerate(clip_batch): #Loops for all batches and items in this batch of clips
+        T=item['clip_len'] #Gets the clip length
+
+        #Fill in with real frames and mark mask true where frames exist (we are padding at the end of the time dimension)
+        images_padded[b,:T]=item['images'] 
+        padding_mask[b,:T]=True
+
+        #Pad the keypoints and categories
+        kp_padded.append(
+            item['keypoints'] + [[] for _ in range(max_t - T)]
+        ) #Appends empty keypoints to end
+
+        cat_padded.append(
+            item['categories'] + [torch.zeros(-1, dtype=torch.long, device=device)
+                                   for _ in range(max_t - T)]
+        ) #Appends -1 category for each of the pads (-1 is not a real category id)
+        
+        frame_nums.append(item['frame_nums']+[[] for _ in range(max_t - T)])
+        px_mul_x.append(item['px_mul_x']+[[] for _ in range(max_t - T)])
+        px_mul_y.append(item['px_mul_y']+[[] for _ in range(max_t - T)])
+
+        clip_lens.append(T)
+        clip_ids.append(item['clip_id'])
+        metadata.append(item['metadata'])
+    
+    return{
+        'images': images_padded,
+        'padding_mask': padding_mask,
+        'keypoints': kp_padded,
+        'categories': cat_padded,
+        'frame_nums': frame_nums,
+        'px_mul_x': px_mul_x,
+        'px_mul_y': px_mul_y,
+        'clip_len': clip_lens,
+        'clip_id': clip_ids,
+        'metadata': metadata,
+    }
+
+
 
 
 #############################Dataclasses######################
