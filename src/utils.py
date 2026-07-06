@@ -2,14 +2,12 @@ import json
 import re
 import os
 import glob
-from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 import numpy as np
 import pydicom
 from scipy.ndimage import map_coordinates
-from dataclasses import dataclass
-import cv2
 from PIL import Image
 
 #Class ID numbers

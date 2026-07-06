@@ -3,6 +3,7 @@
 import datasplitter
 import time #Used to calculate run-time
 from AIUSDataset import AIUSDataset
+import numpy as np
 
 #Setup the datasplitter:
 
@@ -218,7 +219,7 @@ aug_prob=0.1
 return_mode='frame'
 
 
-start_time=time.perf_counter() #Start timer
+#start_time=time.perf_counter() #Start timer
 
 train_data=AIUSDataset(
     json_paths=train_paths,
@@ -232,18 +233,21 @@ train_data=AIUSDataset(
     return_mode=return_mode
 )
 
-print('===================')
-end_time=time.perf_counter() #End timer
-execution_time=end_time-start_time
-print(f"Dataloader _init_ runtime: {execution_time:.6f} seconds")
+#print('===================')
+#end_time=time.perf_counter() #End timer
+#execution_time=end_time-start_time
+#print(f"Dataloader _init_ runtime: {execution_time:.6f} seconds")
 print('===================')
 
-start_time=time.perf_counter() #Start timer
+#start_time=time.perf_counter() #Start timer
 
-train_data.__getitem__(1) #Tests the getitem
+return_data=train_data.__getitem__(1) #Tests the getitem
+print('Image Shape: '+str(return_data['image'].shape))
+print('Keypoint Shape: '+str(np.shape(return_data['keypoints'])))
+print('Categories Shape: '+str(return_data['categories'].shape))
 
-print('===================')
-end_time=time.perf_counter() #End timer
-execution_time=end_time-start_time
-print(f"Dataloader __getitem__ with return_mode: {return_mode} runtime: {execution_time:.6f} seconds")
-print('===================')
+#print('===================')
+#end_time=time.perf_counter() #End timer
+#execution_time=end_time-start_time
+#print(f"Dataloader __getitem__ with return_mode: {return_mode} runtime: {execution_time:.6f} seconds")
+#print('===================')
