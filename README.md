@@ -8,26 +8,46 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
 2. _Install git_
    - [https://git-scm.com/install/](https://git-scm.com/install/)
 3. _Install Microsoft C++ Build Tools_
+   **Windows:**
    - [https://visualstudio.microsoft.com/visual-cpp-build-tools/](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
    - Select 'Desktop development with C++'
-4. _UV_ (optional, can simply use pip)
+   **Linux:**
+   ```
+   bash
+   sudo apt update
+   sudo apt install build-essential  # Ubuntu/Debian
+   # or
+   sudo yum groupinstall "Development Tools"  # CentOS/RHEL
+   ```
+   **macOS:**
+   ```
+   xcode-select --install
+   ```
+5. _UV_ (optional, can simply use pip)
    - [https://docs.astral.sh/uv/getting-started/installation/#__tabbed_1_2](https://docs.astral.sh/uv/getting-started/installation/#__tabbed_1_2)
-5. _Virtual Environment & Python Setup_ (required)
+6. _Virtual Environment & Python Setup_ (required)
    - We use python 3.11.15 => version number is important
    - Create a 'Venvs' folder, create the venv with the correct python version, activate the venv:
+     **Windows:**
      ```
      cd <root_directory>\Venvs
      uv venv --python 3.11 keypointdetect_venv
      keypointdetect_venv\Scripts\activate
-     ``` 
-6. _Verify And Install CUDA If Using NVIDIA GPU_ (required)
+     ```
+     **Linux/macOS:**
+     ```
+     cd <root_directory>/Venvs
+      uv venv --python 3.11 keypointdetect_venv
+      source keypointdetect_venv/bin/activate
+     ```
+7. _Verify And Install CUDA If Using NVIDIA GPU_ (required)
    - Run ``` nvcc --version ```, if no CUDA toolkit version, proceed with CUDA installation (we have CUDA compilation tools version 13.0)
    - Open 'device manager' on device (if using windows), check under Display Adapters for the GPU
    - Open 'NVIDIA control panel' on device and verify NVIDIA GPU card type and driver version (we are using NVIDIA GeForce RTX 5070 with driver version 581.95)
    - Open 'NVIDIA app' on device, navigate to drivers tab, download latest updates
    - Go to 'NVIDIA CUDA Toolkit download' website [https://developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads) and download CUDA toolkit for system
    - Rerun ``` nvcc --version ``` to verify install (we have CUDA compilation tools version 13.0)
-7. _Install Torch_ (required)
+8. _Install Torch_ (required)
    - To install with your CUDA version (previous step), use official website: [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/)
    - We ran:
      ```
@@ -37,7 +57,7 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
      ```
      uv pip install "setuptools<70" wheel pip
      ```
-8. _Install MMPose_ (required)
+9. _Install MMPose_ (required)
    - Install mmengine: ```uv pip install mmengine```
    - Create a dependencies directory (see repo diagram): <root_directory>\Code\ai4ultrasound-keypoint-detect\dependencies
    - Clone and build mmcv from source:
@@ -60,14 +80,14 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
      uv pip install mmdet==3.2.0
      uv pip install "mmpose>=1.1.0" --no-build-isolation
      ```
-9. _Update NumPy, xtcoco tools, and setuptools for MMPose Compatability_ (required)
+10. _Update NumPy, xtcoco tools, and setuptools for MMPose Compatability_ (required)
      ```
      uv pip uninstall numpy
      uv pip install "numpy==1.26.4" --no-deps
      uv pip install xtcocotools --force-reinstall --no-binary xtcocotools --no-build-isolation
      uv pip install "setuptools>=65.0,<70" --force-reinstall
      ```
-10. _Install requirements.txt_ (required)
+11. _Install requirements.txt_ (required)
      ```
      cd  <root_directory>\Code\ai4ultrasound-keypoint-detect
      uv pip install -r requirements.txt
