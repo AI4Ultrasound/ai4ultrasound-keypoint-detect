@@ -31,7 +31,7 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
    - To install with your CUDA version (previous step), use official website: [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/)
    - We ran:
      ```
-     uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu13
+     uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
      ```
    - Fix setuptools (for MMPose compatability):
      ```
@@ -47,18 +47,18 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
      git clone https://github.com/open-mmlab/mmcv.git
      cd mmcv
      git checkout v2.1.0
-     cv <root_directory>\Venvs
+     cd <root_directory>\Venvs
      keypointdetect_venv\Scripts\activate
      cd <root_directory>\Code\ai4ultrasound-keypoint-detect\dependencies\mmcv
      $env:CL = "/Zc:preprocessor"
      uv pip install -r requirements/optional.txt     
-     uv pip install -v -e . --no-build-isolation
+     uv pip install . --no-build-isolation #This can take a long time to build
      ```
    - Install MMDet and MMPose and openmim:
      ```
+     uv pip install -U openmim
      uv pip install mmdet==3.2.0
      uv pip install "mmpose>=1.1.0" --no-build-isolation
-     uv pip install -U openmim
      ```
 9. _Update NumPy, xtcoco tools, and setuptools for MMPose Compatability_ (required)
      ```
