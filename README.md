@@ -61,46 +61,46 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
      uv pip install -U openmim
      ```
 9. _Update NumPy, xtcoco tools, and setuptools for MMPose Compatability_ (required)
-   ```
-   uv pip uninstall numpy
-   uv pip install "numpy==1.26.4" --no-deps
-   uv pip install xtcocotools --force-reinstall --no-binary xtcocotools --no-build-isolation
-   uv pip install "setuptools>=65.0,<70" --force-reinstall
-   ```
+     ```
+     uv pip uninstall numpy
+     uv pip install "numpy==1.26.4" --no-deps
+     uv pip install xtcocotools --force-reinstall --no-binary xtcocotools --no-build-isolation
+     uv pip install "setuptools>=65.0,<70" --force-reinstall
+     ```
 10. _Install requirements.txt_ (required)
-   ```
-   cd  <root_directory>\Code\ai4ultrasound-keypoint-detect
-   uv pip install -r requirements.txt
-   ```
+     ```
+     cd  <root_directory>\Code\ai4ultrasound-keypoint-detect
+     uv pip install -r requirements.txt
+     ```
    - **Notes:**
       - Might need to remove '+cu130' from requirements.txt
       - Might need to remove 'mmcv @ file:///C:/Users/Alexandre%20Banks/Documents/Research_Summer2026/Code/ai4ultrasound-keypoint-detect/dependencies/mmcv' from requirements.txt
 11. _Fix torch.load function_ (required)
    - Edit mmengine checkpoint file:
-     -   Move to '<root_directory>\Venvs\keypointdetect_venv\Lib\site-packages\mmengine\runner\checkpoint.py'
-     -   Open the checkpoint.py file
-     -   Find the line: 'checkpoint = torch.load(filename, map_location=map_location)' and change it to: 'checkpoint = torch.load(filename, map_location=map_location, weights_only=False)'
+      -   Move to '<root_directory>\Venvs\keypointdetect_venv\Lib\site-packages\mmengine\runner\checkpoint.py'
+      -   Open the checkpoint.py file
+      -   Find the line: 'checkpoint = torch.load(filename, map_location=map_location)' and change it to: 'checkpoint = torch.load(filename, map_location=map_location, weights_only=False)'
 12. _Setup mmpose_demo.py_ (optional)
    - Download the keypoint detection models for the mmpose_demo.py script:
-      ```
-      cd <root_directory>\Code\ai4ultrasound-keypoint-detect\mmpose_demo
-      uv run mim download mmpose --config td-hm_hrnet-w48_8xb32-210e_coco-256x192 --dest .
-      ```
+     ```
+     cd <root_directory>\Code\ai4ultrasound-keypoint-detect\mmpose_demo
+     uv run mim download mmpose --config td-hm_hrnet-w48_8xb32-210e_coco-256x192 --dest .
+     ```
    - Run the mmpose_demo (should produce a demo_result.jpg in the mmpose_demo folder):
      ```
      python .\mmpose_demo.py
      ```
 13. _Run Other Package Checks_ (optional)
-    ```
-    python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-    python -c "import mmcv; print(mmcv.__file__)" # Should show path inside site-packages
-    python -c "import mmcv; print(mmcv.__version__)"
-    python -c "import mmengine; print(mmengine.__version__)"
-    python -c "import mim; print('mim ok')"   # Must not error
-    python -c "import mmpose; print(mmpose.__version__)"     # Must not error
-    python -c "import mmdet; print(mmdet.__version__)"    
-    python -c "import numpy; print(numpy.__version__)"  # Should show 1.26.4
-    python -c "from xtcocotools.coco import COCO; print('xtcocotools ok')"
-    python -c "import pkg_resources; print('pkg_resources ok')"
-    ```
+     ```
+     python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+     python -c "import mmcv; print(mmcv.__file__)" # Should show path inside site-packages
+     python -c "import mmcv; print(mmcv.__version__)"
+     python -c "import mmengine; print(mmengine.__version__)"
+     python -c "import mim; print('mim ok')"   # Must not error
+     python -c "import mmpose; print(mmpose.__version__)"     # Must not error
+     python -c "import mmdet; print(mmdet.__version__)"    
+     python -c "import numpy; print(numpy.__version__)"  # Should show 1.26.4
+     python -c "from xtcocotools.coco import COCO; print('xtcocotools ok')"
+     python -c "import pkg_resources; print('pkg_resources ok')"
+     ```
 
