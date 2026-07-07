@@ -50,8 +50,8 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
      cv <root_directory>\Venvs
      keypointdetect_venv\Scripts\activate
      cd <root_directory>\Code\ai4ultrasound-keypoint-detect\dependencies\mmcv
-     uv pip install -r requirements/optional.txt
      $env:CL = "/Zc:preprocessor"
+     uv pip install -r requirements/optional.txt     
      uv pip install -v -e . --no-build-isolation
      ```
    - Install MMDet and MMPose and openmim:
