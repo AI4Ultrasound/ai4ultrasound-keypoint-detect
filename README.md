@@ -1,16 +1,18 @@
 # ai4ultrasound-keypoint-detect
 Detecting pleural and B-lines via keypoint detection methods. Use keypoints to compute percent pleura.
 
-### tab Installation
+# Installation
 1. _Visual Studio Code_ (optional, can use other editor)
    - [https://code.visualstudio.com/download?_exp_download=d53503e735](https://code.visualstudio.com/download?_exp_download=d53503e735)
    - Install Python, Python Debugger, Pylance, Python Environment and Jupyter extensions
 2. _Install git_
    - [https://git-scm.com/install/](https://git-scm.com/install/)
 3. _Install Microsoft C++ Build Tools_
+   
    **Windows:**
    - [https://visualstudio.microsoft.com/visual-cpp-build-tools/](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
    - Select 'Desktop development with C++'
+     
    **Linux:**
    ```
    bash
@@ -28,6 +30,7 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
 6. _Virtual Environment & Python Setup_ (required)
    - We use python 3.11.15 => version number is important
    - Create a 'Venvs' folder, create the venv with the correct python version, activate the venv:
+     
      **Windows:**
      ```
      cd <root_directory>\Venvs
@@ -42,6 +45,7 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
      ```
 7. _Verify And Install CUDA If Using NVIDIA GPU_ (required)
    - Run:
+     
      **Windows:**
      ```
      nvcc --version
@@ -72,6 +76,7 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
    - Install mmengine: ```uv pip install mmengine```
    - Create a dependencies directory (see repo diagram): <root_directory>\Code\ai4ultrasound-keypoint-detect\dependencies
    - Clone and build mmcv from source:
+     
      **Windows:**
      ```
      cd <root_directory>\Code\ai4ultrasound-keypoint-detect\dependencies
@@ -127,6 +132,7 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
      uv pip install "setuptools>=65.0,<70" --force-reinstall
      ```
 11. _Install requirements.txt_ (required)
+    
      **Windows:**
      ```
      cd  <root_directory>\Code\ai4ultrasound-keypoint-detect
@@ -147,6 +153,7 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
       -   Find the line: 'checkpoint = torch.load(filename, map_location=map_location)' and change it to: 'checkpoint = torch.load(filename, map_location=map_location, weights_only=False)'
 12. _Setup mmpose_demo.py_ (optional)
    - Download the keypoint detection models for the mmpose_demo.py script:
+     
      **Windows:**
      ```
      cd <root_directory>\Code\ai4ultrasound-keypoint-detect\mmpose_demo
