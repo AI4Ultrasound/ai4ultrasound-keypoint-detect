@@ -571,19 +571,20 @@ class AIUSDataset(Dataset):
         Similarly, 'stand+clip' loses information because of clip.
         Similarly, 'clip+lin' loses information because of clip.
         """
-        if not is_gpu: #Run processing on the CPU
+        if not is_gpu and (self.normalize_method is not None): #Run processing on the CPU
             mean_val=self.norm_stats['mean']
             std_val=self.norm_stats['std']
             max_val=self.norm_stats['max']
             min_val=self.norm_stats['min']
             img=image_tensor.detach().cpu().float().numpy() #Move the image tensor to the CPU and convert to numpy array, and detach from the computation graph
-        else: #Run processing on the GPU
+        elif self.normalize_method is not None: #Run processing on the GPU
             mean_val=self.stats_for_normalization_gpu['mean']
             std_val=self.stats_for_normalization_gpu['std']
             max_val=self.stats_for_normalization_gpu['max']
             min_val=self.stats_for_normalization_gpu['min']
             img=image_tensor.detach().float() #Keep the image tensor on the GPU, detach from the computaiton graph and convert to float
-        
+        else:
+            img=image_tensor.detach().cpu().float().numpy()
         #Unnormalize image based on normalization method
         img_unnorm=None
         if self.normalize_method is None: #We did no normalization
