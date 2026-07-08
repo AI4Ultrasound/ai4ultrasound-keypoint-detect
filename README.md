@@ -9,23 +9,8 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
 
 *Affiliations:* Harvard University (Dr. Tina Kapur Lab)
 
-# Requirements
-- NVIDIA GPU recommended (required for CUDA acceleration)
-  - macOS: No NVIDIA CUDA support — uses CPU or Apple MPS instead
-- ~50GB free disk space:
-   - ~10GB for models, dependencies and venv
-   - ~40GP for data
-- Internet connection (for downloading packages and model weights)
-  
-# Platform Support
-| Platform | GPU Acceleration | Notes |
-|---|---|---|
-| Windows | CUDA (NVIDIA) | Full support |
-| Linux | CUDA (NVIDIA) | Full support |
-| macOS (Intel) | CPU only | No CUDA, no MPS |
-| macOS (Apple Silicon M1/M2/M3/M4) | MPS | Metal Performance Shaders |
-
 # Project Repository
+The overall project repository should be organized as follows, with this Github repo cloned into the 'Code/' folder.
 ```
 root_directory
 +---Code/
@@ -94,6 +79,22 @@ Keypoint_Detect_Data/COCO_Data
             <Annotator>_<clipid>_<framenum>.png
             ...
 ```
+
+# Requirements
+- NVIDIA GPU recommended (required for CUDA acceleration)
+  - macOS: No NVIDIA CUDA support — uses CPU or Apple MPS instead
+- ~50GB free disk space:
+   - ~10GB for models, dependencies and venv
+   - ~40GB for data
+- Internet connection (for downloading packages and model weights)
+  
+# Platform Support
+| Platform | GPU Acceleration | Notes |
+|---|---|---|
+| Windows | CUDA (NVIDIA) | Full support |
+| Linux | CUDA (NVIDIA) | Full support |
+| macOS (Intel) | CPU only | No CUDA, no MPS |
+| macOS (Apple Silicon M1/M2/M3/M4) | MPS | Metal Performance Shaders |
 
 # Installation
 1. _Visual Studio Code_ (optional, can use other editor)
