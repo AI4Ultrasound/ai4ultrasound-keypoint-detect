@@ -9,6 +9,79 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
 
 *Affiliations:* Harvard University (Dr. Tina Kapur Lab)
 
+# Using & Running the Code
+Below is a table summarizing the different scripts, classes, and subdirectories and their functionalities.
+<table>
+  <thead>
+    <tr>
+      <th>Pre-Processing & Data Loading</th>
+      <th>Model Training</th>
+      <th>Utility, Testing & Supplementary Scripts</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td valign="top">
+        <b>src/preprocessing.py</b><br>
+        - Sets up new directory structure and saves annotations/images 
+        as both sector and scanline formats
+      </td>
+      <td valign="top">
+        <b>src/main.py</b><br>
+        - Code entry point for training and testing models
+      </td>
+      <td valign="top">
+        <b>src/utils.py</b><br>
+        - Collection of data handling, mathematical operations 
+        and visualization functions
+      </td>
+    </tr>
+    <tr>
+      <td valign="top">
+        <b>src/datasplitter.py</b><br>
+        - Performs K-fold or train/val/test splitting and returns 
+        corresponding lists of .json filepaths
+      </td>
+      <td valign="top">
+        <b>src/LossFunctions.py</b><br>
+        - <i>KeypointLoss</i> (class)<br>
+        - Contains collection of loss function classes
+      </td>
+      <td valign="top">
+        <b>src/tester_datasplitter.py</b><br>
+        - Tests performance speed of datasplitter.py
+      </td>
+    </tr>
+    <tr>
+      <td valign="top">
+        <b>src/AIUSDataset.py</b><br>
+        - <i>AIUSDataset</i> (class)<br>
+        - Efficient data interface for loading data during training<br>
+        - Performs pre-processing in initialization (normalization, 
+        resampling, colour conversion)<br>
+        - Handles both frame-level and clip-level keypoint prediction
+      </td>
+      <td valign="top">
+        <b>src/ModelTrainer.py</b><br>
+        - ML model training loop<br>
+        - Handles both frame-level and clip-level keypoint prediction
+      </td>
+      <td valign="top">
+        <b>src/tester_dataloader.py</b><br>
+        - Tests performance speed of AIUSDataset.py
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- Commented this out because using above markup table for top-alignment
+| Pre-Processing & Data Loading | Model Training | Utility, Testing & Supplementary Scripts |
+| --- | --- | --- |
+| src/preprocessing.py <br>     - Sets up new diretory structure and saves annotations/images as both sector and scanline formats | src/main.py <br>    - Code entry point for training and testing models | src/utils.py <br>    - Collection of data handling, mathematical operations and visualization functions | 
+| src/datasplitter.py <br>     - Performs K-fold or train/val/test splitting and returns corresponding lists of .json filepaths | src/LossFunctions.py <br>    - _KeypointLoss_ (class) <br>    - Contains collection of loss function classes | src/tester_datasplitter.py <br>    - Tests performance speed of datasplitter.py|
+| src/AIUSDataset.py <br>     - _AIUSDataset_ (class) <br>     - Efficient data interface for loading data during training <br>     - Performs pre-processing in initialization (normalization, resampling, colour conversion) <br>     - Handles both frame-level and clip-level keypoint prediction | src/ModelTrainer.py <br>    - ML model training loop <br>     - Handles both frame-level and clip-level keypoint prediction| src/tester_dataloader.py <br>    - Tests performance speed of AIUSDataset.py| 
+-->
+
 # Project Repository
 The overall project repository should be organized as follows, with this Github repo cloned into the 'Code/' folder.
 ```
