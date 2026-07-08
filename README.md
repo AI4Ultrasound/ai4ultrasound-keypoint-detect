@@ -1,6 +1,30 @@
 # ai4ultrasound-keypoint-detect
 Detecting pleural and B-lines via keypoint detection methods. Use keypoints to compute percent pleura.
 
+# Author & Contact Information
+
+*Author:* Alexandre L. Banks Gadbois
+
+*Email:* alexandre_banksgadbois@hms.harvard.edu or abanksga@unb.ca
+
+*Affiliations:* Harvard University (Dr. Tina Kapur Lab)
+
+# Requirements
+- NVIDIA GPU recommended (required for CUDA acceleration)
+  - macOS: No NVIDIA CUDA support — uses CPU or Apple MPS instead
+- ~50GB free disk space:
+   - ~10GB for models, dependencies and venv
+   - ~40GP for data
+- Internet connection (for downloading packages and model weights)
+  
+# Platform Support
+| Platform | GPU Acceleration | Notes |
+|---|---|---|
+| Windows | CUDA (NVIDIA) | Full support |
+| Linux | CUDA (NVIDIA) | Full support |
+| macOS (Intel) | CPU only | No CUDA, no MPS |
+| macOS (Apple Silicon M1/M2/M3/M4) | MPS | Metal Performance Shaders |
+
 # Installation
 1. _Visual Studio Code_ (optional, can use other editor)
    - [https://code.visualstudio.com/download?_exp_download=d53503e735](https://code.visualstudio.com/download?_exp_download=d53503e735)
