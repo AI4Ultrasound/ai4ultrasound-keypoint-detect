@@ -25,6 +25,76 @@ Detecting pleural and B-lines via keypoint detection methods. Use keypoints to c
 | macOS (Intel) | CPU only | No CUDA, no MPS |
 | macOS (Apple Silicon M1/M2/M3/M4) | MPS | Metal Performance Shaders |
 
+# Project Repository
+```
+root_directory
++---Code/
+|   +---ai4ultrasound-keypoint-detect/
+|   |   +---dependencies/
+|   |   |   +---mmcv/
+|   |   +---mmpose_demo/
+|   |   +---src/
+|   |       LICENSE
+|   |       README.md
+|   |       requirements.txt
++---Data/
+|   +---Group-001/
+|   +---Keypoint_Detect_Data/
+|   +---usframecache/
++---Venvs/
+|   +---keypointdetect_venv/
+```
+
+The 'Group-001' folder contains the raw data and the original data structure tree which is formatted as:
+```
++---<Annotator>/
+|   +---<Annotator>-<site_id>/
+|   |       <clipid>.<Annotator>.json
+|   |       <clipid>.dcm
+|   |       ...
+|   +---<Annotator>-<site_id>/
+|   +---<Annotator>-<site_id>/
+|   +---<Annotator>-<site_id>/
+|   +---<Annotator>-<site_id>/
+|   ...
+|   +---<Annotator>-<site_id>_<patient_id>_<diuretic_time>/
+|   +---<Annotator>-<site_id>_<patient_id>_<diuretic_time>/
+|   +---<Annotator>-<site_id>_<patient_id>_<diuretic_time>/
+|   ...
+|   +---<Annotator>-<site_id>_<patient_id>_<diuretic_time>/
+|   +---<Annotator>-<site_id>_<patient_id>_<diuretic_time>_<probe_orientation>/
+|   +---<Annotator>-<site_id>_<patient_id>_<diuretic_time>_<probe_orientation>/
+|   +---<Annotator>-<site_id>_<patient_id>_<diuretic_time>_<probe_orientation>/
+|   ...
++---<Annotator>/
+|   ...
+...
+```
+
+The new data structure (re-organized by preprocessing.py) is in the 'Keypoint_Detect_Data' folder, which has the following structure:
+Overview of new data structure:
+```
+Keypoint_Detect_Data/COCO_Data
++---annotations/
+|   +---scanline/
+|   |       <Annotator>_<clipid>.json
+|   |       <Annotator>_<clipid>.json
+|   |       ...
+|   +---sector/
+|           <Annotator>_<clipid>.json
+|           <Annotator>_<clipid>.json
+|           ...
++---images/
+    +---scanline/
+    |       <Annotator>_<clipid>_<framenum>.png
+    |       <Annotator>_<clipid>_<framenum>.png
+    |       ...
+    +---sector/
+            <Annotator>_<clipid>_<framenum>.png
+            <Annotator>_<clipid>_<framenum>.png
+            ...
+```
+
 # Installation
 1. _Visual Studio Code_ (optional, can use other editor)
    - [https://code.visualstudio.com/download?_exp_download=d53503e735](https://code.visualstudio.com/download?_exp_download=d53503e735)
