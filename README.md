@@ -354,8 +354,10 @@ Keypoint_Detect_Data/COCO_Data
      python -c "import pkg_resources; print('pkg_resources ok')"
      ```
 
+# License
+This work is protected under the [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) license.
 
-# Background and References
+# References
 
 - [1] Lucassen RT, Jafari MH, Duggan NM, Jowkar N, Mehrtash A, Fischetti C, Bernier D, Prentice K, Duhaime EP, Jin M, Abolmaesumi P. Deep learning for detection and localization of B-lines in lung ultrasound. IEEE journal of biomedical and health informatics. 2023 Jun 5;27(9):4352-61.
 
