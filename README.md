@@ -1,4 +1,4 @@
-# ai4ultrasound-keypoint-detect
+# ai4ultrasound-keypoint-detect Summary
 This repository contains code to automatically detect pleural and B-lines in lung ultrasound via keypoint detection methods and, using this, compute the percentage pleura. Our goal is to train, modify and validate keypoint detection models such as ViTPose++ and HRNet with UDP. 
 
 The clinical motivation for this is that one of the primary indicators of acute heart failure is the presence of pulmonary congestion. To detect fluid build up quickly in the emergency room, lung ultrasound exams are taken of the patient. Clinicians look for hyperechoic artifacts (B-lines) that appear in the image, where the more they see the more congested the patient is. 
