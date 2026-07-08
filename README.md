@@ -1,5 +1,9 @@
 # ai4ultrasound-keypoint-detect
-Detecting pleural and B-lines via keypoint detection methods. Use keypoints to compute percent pleura.
+This repository contains code to automatically detect pleural and B-lines in lung ultrasound via keypoint detection methods and, using this, compute the percentage pleura. Our goal is to train, modify and validate keypoint detection models such as ViTPose++ and HRNet with UDP. 
+
+The clinical motivation for this is that one of the primary indicators of acute heart failure is the presence of pulmonary congestion. To detect fluid build up quickly in the emergency room, lung ultrasound exams are taken of the patient. Clinicians look for hyperechoic artifacts (B-lines) that appear in the image, where the more they see the more congested the patient is. 
+
+Unfortunately, manual detection of these B-lines is difficult due to the image quality, which depends on the type of transducer and the expertise of the clinician. Therefore, AI models have started to be developed to quickly detect these B-lines. Our group, over the past few years, has developed multiple methods [1], [2], [3]. One of the drawbacks though, is that existing models do not compute the pleural percentage, the ratio of the B-line sectors to the pleural line sectors, which is strongly associated with extravascular lung water and consistent with other semi-quantitative clinical scores [4].
 
 # Author & Contact Information
 
@@ -349,4 +353,21 @@ Keypoint_Detect_Data/COCO_Data
      python -c "from xtcocotools.coco import COCO; print('xtcocotools ok')"
      python -c "import pkg_resources; print('pkg_resources ok')"
      ```
+
+
+# Background and References
+
+- [1] Lucassen RT, Jafari MH, Duggan NM, Jowkar N, Mehrtash A, Fischetti C, Bernier D, Prentice K, Duhaime EP, Jin M, Abolmaesumi P. Deep learning for detection and localization of B-lines in lung ultrasound. IEEE journal of biomedical and health informatics. 2023 Jun 5;27(9):4352-61.
+
+- [2] Asgari-Targhi A, Ungi T, Jin M, Harrison N, Duggan N, Duhaime E, Goldsmith A, Kapur T. Can Crowdsourced Annotations Improve AI-Based Congestion Scoring for Bedside Lung Ultrasound?. InInternational Conference on Medical Image Computing and Computer-Assisted Intervention 2024 Oct 7 (pp. 580-590). Cham: Springer Nature Switzerland.[3] MICCAI 2026 submission. 
+
+- [3] MICCAI 2026 acceptance. AI-Driven Pulmonary Congestion Assessment for Lung Ultrasound via Segmentation-Guided Transformers.
+  
+- [4] Brusasco C, Santori G, Bruzzo E, et al. Quantitative lung ultrasonography: a putative new 
+algorithm for automatic detection and quantification of B-lines. Crit Care. 2019;23(1):288.
+
+# Funding
+
+This work is supported by NIH [R01EB035679](https://reporter.nih.gov/project-details/11267990) and [R21EB034075](https://reporter.nih.gov/project-details/10741596).
+
 
