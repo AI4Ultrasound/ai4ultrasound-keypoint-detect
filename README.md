@@ -1,7 +1,7 @@
 # ai4ultrasound-keypoint-detect
 Detecting pleural and B-lines via keypoint detection methods. Use keypoints to compute percent pleura.
 
-# Installation
+### tab Installation
 1. _Visual Studio Code_ (optional, can use other editor)
    - [https://code.visualstudio.com/download?_exp_download=d53503e735](https://code.visualstudio.com/download?_exp_download=d53503e735)
    - Install Python, Python Debugger, Pylance, Python Environment and Jupyter extensions
