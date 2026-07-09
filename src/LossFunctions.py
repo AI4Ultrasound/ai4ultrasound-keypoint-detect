@@ -82,7 +82,7 @@ class KeypointLoss(nn.Module):
             target=target keypoints (B,K,2) - padded to max K
             visibility=keypoint flags (B,K) - 1=present, 0=absent/padded (this is dirac delta)
             areas=area of bounding box (B,K) - each keypoint's object area
-            categories: 1 = pleural line, 2=b-line, 0=padded (because we pad to max K). Used to assign correct sigma to each keypoint
+            categories: 1 = pleural line, 2=b-line, -1=padded/empty (because we pad to max K). Used to assign correct sigma to each keypoint
         '''
         #Get the squared euclidean distance between points d^2 = (x1-x2)^2 + (y1-y2)^2
         dist_sq=torch.sum((pred-target)**2,dim=-1) # Shape: (B, K)
@@ -127,11 +127,12 @@ class KeypointLoss(nn.Module):
 
     def forward(self,pred,target,visibility=None,areas=None,categories=None):
         '''
-        pred=predicted keypoints (B,K,2) - padded to max K when loss_type=OKS
-        target=target keypoints (B,K,2) - padded to max K when loss_type=OKS
-        visibility=keypoint flags (B,K) - 1=present, 0=absent/padded (this is dirac delta) - used when loss_type=OKS
-        areas=area of bounding box (B,K) - each keypoint's object area - used when when loss_type=OKS
+        pred=predicted keypoints (B,T,K,2) - padded to max K when loss_type=OKS
+        target=target keypoints (B,T,K,2) - padded to max K when loss_type=OKS
+        visibility=keypoint flags (B,T,K) - 1=present, 0=absent/padded (this is dirac delta) - used when loss_type=OKS
+        areas=area of bounding box (B,T,K) - each keypoint's object area - used when when loss_type=OKS
         categories: 1 = pleural line, 2=b-line, 0=padded (because we pad to max K). Used to assign correct sigma to each keypoint - used when loss_type=OKS
+        *Note: No 'T' dimension when return_mode=frame
         '''
 
         ######If we are doing 'clip' mode, we convert from (B,T,K,2) to (B*T,K,2)

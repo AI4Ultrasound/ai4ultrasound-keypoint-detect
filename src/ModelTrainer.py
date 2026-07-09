@@ -50,18 +50,38 @@ class ModelTrainer(nn.Module):
                     px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul)
                     px_mul_y=data['px_mul_y']
 
+                    #Gets prediction and runs the loss
+                    pred_keypoints=self.model(us_frames)
+                    loss=self.loss_fun(pred_keypoints,target_keypoints)
+
                 if self.return_mode=='clip': #Using the clip_collate_fn return where we pad the end of the time dimension with zeros
                     us_frames=data['images'].to(self.device,non_blocking=True) #(B,T, C, H, W)
-                    padding_mask=data['padding_mask'].to(self.device,non_blocking=True) #(B,T,)
-                    target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,T,list[N_t,K_i,2])                    
-                    categories=data['categories'].to(self.device,non_blocking=True) #(B,T,N_t)
-                    px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul)
+                    padding_mask=data['padding_mask'].to(self.device,non_blocking=True) #(B,T)
+                    #Skip this batch if less than two batches are valid
+                    if padding_mask.sum()<2:
+                        del us_frames,padding_mask
+                        continue
+                    px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul), (B,T)
                     px_mul_y=data['px_mul_y']
-                #Gets the prediction:
-                pred_keypoints=self.model(us_frames)
-                #Runs the loss function
 
-                loss=self.loss_fun(pred_keypoints,target_keypoints)
+                    #Run the prediction
+                    pred_keypoints=self.model(us_frames,padding_mask)
+
+                    #Get target keypoints, visibiity and categories
+                    target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,T,K_max,2)  
+                    areas=data['areas'].to(self.device,non_blocking=True)  #(B,T,K)
+                    visibility=data['visbility'].to(self.device,non_blocking=True) #(B,T,K_max)
+                    categories=data['categories'].to(self.device,non_blocking=True) #(B,T,K_max)
+
+                    visibility=visibility & padding_mask.unsqueeze(-1) #mask out any visibility for frames which have been padded
+
+                    if not visibility.any():
+                        del us_frames,padding_mask, target_keypoints,visibility,categories
+                        continue
+
+                    #Gets the loss
+                    loss=self.loss_fun(pred_keypoints,target_keypoints,visibility,areas,categories)
+                
 
                 if torch.isnan(loss):
                     self.optimizer.zero_grad()

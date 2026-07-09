@@ -843,12 +843,13 @@ class AIUSDataset(Dataset):
                     for a in entry['annotations']
                 ]
                 categories = torch.tensor([a['category_id'] for a in entry['annotations']],dtype=torch.long) 
-
+                kp_counts=sum(ann.shape[0] for ann in keypoints)
                 #Saves the results, sample_index is the main object that we call from in _getitem_
                 self.sample_index.append({
                     'cache_path':    cache_path,
                     'keypoints':     keypoints,   # List[ndarray (N_i, 2)] — variable length
                     'categories':    categories,  # List[int]
+                    'kp_counts':     kp_counts, 
                     'frame_num':     fn,
                     'px_mul_x':      entry['px_mul_x'],
                     'px_mul_y':      entry['px_mul_y'],
@@ -862,7 +863,11 @@ class AIUSDataset(Dataset):
             #Init the lists to hold the per-frame data for this clip
             clip_cache_paths = []
             clip_keypoints   = []
+            flat_keypoints = [] #(T,K,2)
             clip_categories  = []
+            flat_categories = [] #(T,K)
+            flat_areas=[] #(T,K) Area for each keypoint
+            clip_kp_counts = [] #Holds the area for each keypoint set as a bounding box
             clip_frame_nums  = []
             clip_px_mul_x    = []
             clip_px_mul_y    = []
@@ -877,7 +882,28 @@ class AIUSDataset(Dataset):
                     torch.tensor(np.array(a['keypoints'], dtype=np.float32))
                     for a in entry['annotations']
                 ]
+
                 categories = torch.tensor([a['category_id'] for a in entry['annotations']],dtype=torch.long)
+                
+                #Compute flat keypoints which are all the annotations concatenated (remove the annotation dimension)
+                if len(keypoints)<1:
+                    flat_keypoints.append(torch.zeros(0,2)) #Empty annotation list
+                    flat_categories.append(torch.tensor(-1,dtype=torch.long)) #-1 for no category
+
+                else:
+                    #Flatten annotations for this frame
+                    flat_keypoints.append(torch.cat(keypoints,dim=0)) #(K,2)
+                    #Expand categories so for N annotations => K keypoints
+                    flat_categories.append(torch.cat([
+                        categories[ann_idx].expand(ann_kps.shape[0])
+                        for ann_idx,ann_kps in enumerate(keypoints)
+                    ]))
+
+                    #Compute the areas for the keypoints
+                    flat_areas.append(torch.cat())
+                
+                #Compute number of keypoints
+                clip_kp_counts.append(sum(ann.shape[0] for ann in keypoints)) #Computes total keypoints for this frame
 
                 clip_cache_paths.append(cache_path)
                 clip_keypoints.append(keypoints)
@@ -890,11 +916,17 @@ class AIUSDataset(Dataset):
             if not clip_cache_paths:
                 return #No valid frames for this clip
             
+            
+
+            
             #T=number of frames in clip
             self.sample_index.append({
             'cache_paths':   clip_cache_paths,   # List[str] length T
             'keypoints':     clip_keypoints,     # List[List[ndarray]] (T, K_t, N_i, 2)
+            'flat_keypoints': flat_keypoints,
             'categories':    clip_categories,    # List[List[int]] (T, K_t)
+            'flat_categories': flat_categories,
+            'kp_counts': clip_kp_counts, #List[int] length T
             'frame_nums':    clip_frame_nums,    # List[int] length T
             'px_mul_x':      clip_px_mul_x,      # List[float] length T
             'px_mul_y':      clip_px_mul_y,      # List[float] length T
@@ -956,6 +988,7 @@ class AIUSDataset(Dataset):
             'image'      : FloatTensor (C, H, W)
             'keypoints'  : list[FloatTensor (N_i, 2)]
             'categories' : LongTensor (K,)
+            'kp_counts'  : int
             'frame_num'  : int
             'px_mul_x'   : float
             'px_mul_y'   : float
@@ -964,8 +997,11 @@ class AIUSDataset(Dataset):
 
         if return_mode=='clip' => returns a single clip dict with:
             'images'     : FloatTensor (T, C, H, W)  — padded if using collate_fn
-            'keypoints'  : list[list[FloatTensor (N_i, 2)]]  — shape (T, K_t)
+            'keypoints'  : list[list[FloatTensor (N_i, 2)]]  — shape (T, N_i,K_t,2)
+            'flat_keypoints': shape (T,K,2) #K=N_i*K_t
             'categories' : list[LongTensor (K_t,)]  — one tensor per frame
+            'flat_categories: shape (T,K) K=N_i*K_t
+            'kp_counts'  : list[int] length T
             'frame_nums' : list[int] length T
             'px_mul_x'   : list[float] length T
             'px_mul_y'   : list[float] length T
@@ -1003,6 +1039,7 @@ class AIUSDataset(Dataset):
         'image':      image,
         'keypoints':  sample['keypoints'],
         'categories': sample['categories'],
+        'kp_counts':  sample['kp_counts'],
         'frame_num':  sample['frame_num'],
         'px_mul_x':   sample['px_mul_x'],
         'px_mul_y':   sample['px_mul_y'],
@@ -1035,7 +1072,10 @@ class AIUSDataset(Dataset):
         return {
             'images':     images,
             'keypoints':  sample['keypoints'],
+            'flat_keypoints': sample['flat_keypoints'],
             'categories': sample['categories'],
+            'flat_categories': sample['flatcategories'],
+            'kp_counts':  sample['kp_counts'], #List[int] of length T
             'frame_nums': sample['frame_nums'],
             'px_mul_x':   sample['px_mul_x'],
             'px_mul_y':   sample['px_mul_y'],

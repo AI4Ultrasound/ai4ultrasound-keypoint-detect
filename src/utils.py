@@ -586,12 +586,17 @@ def curvilinear_to_scanlines_coordinates(
     return points_scanlines
 
 ####################Clip Sequence Handling Functions#############
-def clip_collate_fn(clip_batch):
+def clip_collate_fn_base(clip_batch):
     """
     Collate function for when return_mode=='clip' in the AIUSDataset class.
-    This pads the end of the time dimension of all clips in the batch to the length of the longest clip. 
-    Pads using zeros, and returns a boolean padding mask.
+    Images are padded to T_max, keypoints and categories are kept as ragged Python lists.
+    e.g., there is no K_max padding. Use pad_keypoints_for_loss() before calling the loss function
     
+    Output:
+        images: (B,max_t,C,H,W) - zero-padded
+        keypoints: list[list[list[FloatTensor]]] (B,T,N_t,K_i,2) - ragged
+        categories: list[list[LongTensor]] (B,T,N_t) - ragged
+        padding_mask: BoolTensor (B,max_t)
     """
     #Finds the longest clip length in this batch for padding
     max_t=max(item['clip_len'] for item in clip_batch)
@@ -599,21 +604,11 @@ def clip_collate_fn(clip_batch):
 
     #Get the shape of the first frame of the first clip
     C,H,W=clip_batch[0]['images'].shape[1:]
-    device=clip_batch[0]['images'].device
 
     #Allocate output tensors
-    images_padded=torch.zeros(B,max_t,C,H,W,dtype=torch.float32,device=device)
-    padding_mask=torch.zeros(B,max_t,dtype=torch.bool,device=device)
+    images_padded=torch.zeros(B,max_t,C,H,W,dtype=torch.float32)
+    padding_mask=torch.zeros(B,max_t,dtype=torch.bool)
 
-    #Lists to hold the padded annotations and metadata
-    kp_padded  = []
-    cat_padded = []
-    clip_lens  = []
-    clip_ids   = []
-    metadata   = []
-    frame_nums = []
-    px_mul_x = []
-    px_mul_y = []
 
 
     for b,item in enumerate(clip_batch): #Loops for all batches and items in this batch of clips
@@ -622,37 +617,74 @@ def clip_collate_fn(clip_batch):
         #Fill in with real frames and mark mask true where frames exist (we are padding at the end of the time dimension)
         images_padded[b,:T]=item['images'] 
         padding_mask[b,:T]=True
-
-        #Pad the keypoints and categories
-        kp_padded.append(
-            item['keypoints'] + [[] for _ in range(max_t - T)]
-        ) #Appends empty keypoints to end
-
-        cat_padded.append(
-            item['categories'] + [torch.zeros(-1, dtype=torch.long, device=device)
-                                   for _ in range(max_t - T)]
-        ) #Appends -1 category for each of the pads (-1 is not a real category id)
-        
-        frame_nums.append(item['frame_nums']+[[] for _ in range(max_t - T)])
-        px_mul_x.append(item['px_mul_x']+[[] for _ in range(max_t - T)])
-        px_mul_y.append(item['px_mul_y']+[[] for _ in range(max_t - T)])
-
-        clip_lens.append(T)
-        clip_ids.append(item['clip_id'])
-        metadata.append(item['metadata'])
     
-    return{
+    return {
         'images': images_padded,
         'padding_mask': padding_mask,
-        'keypoints': kp_padded,
-        'categories': cat_padded,
-        'frame_nums': frame_nums,
-        'px_mul_x': px_mul_x,
-        'px_mul_y': px_mul_y,
-        'clip_len': clip_lens,
-        'clip_id': clip_ids,
-        'metadata': metadata,
+        'keypoints': [item['keypoints']  for item in clip_batch],
+        'categories': [item['categories']  for item in clip_batch],
+        'frame_nums': [item['frame_nums'] for item in clip_batch],
+        'px_mul_x': [item['px_mul_x']   for item in clip_batch],
+        'px_mul_y': [item['px_mul_y']   for item in clip_batch],
+        'clip_len': [item['clip_len']    for item in clip_batch],
+        'clip_id': [item['clip_id']    for item in clip_batch],
+        'metadata': [item['metadata']    for item in clip_batch],
     }
+
+def clip_collate_fn_fullpad(clip_batch):
+    """
+    Collate function that pads to T_max (max time dimension) and to max keypoints (K_max).
+    """
+    B=len(clip_batch) #Num of batches
+    max_t=max(item['clip_len'] for item in clip_batch)
+    #Get the shape of the first frame of the first clip
+    C,H,W=clip_batch[0]['images'].shape[1:]
+
+    #Compute number of keypoints across all frames in the batch
+    batch_counts=[count for item in clip_batch for count in item['kp_counts']] #Loops for all keypoint counts across all frames across all batches
+    K_max=max(batch_counts)
+    K_max=max(K_max,1)
+
+    #Pre-allocate tensors
+    images=torch.zeros(B,max_t,C,H,W,dtype=torch.float32)
+    keypoints=torch.zeros(B,max_t,K_max,2,dtype=torch.float32)
+    visibility=torch.zeros(B,max_t,K_max,dtype=torch.bool) #Visibility of keypoints
+    categories=torch.full((B, max_t, K_max), -1, dtype=torch.long)
+    padding_mask=torch.zeros(B,max_t,dtype=torch.bool)
+
+    #Fill the data tensors:
+    for b,item in enumerate(clip_batch):
+        T=item['clip_len'] #Gets the clip length
+
+        #Fill in with real frames and mark mask true where frames exist (we are padding at the end of the time dimension)
+        images[b,:T]=item['images'] 
+        padding_mask[b,:T]=True
+
+        for t in range(T): #Loops for all frames in this clip
+            k_t=item['kp_counts'][t] #Gets number of keypoints for this frame
+            if k_t==0:
+                categories[b,t,:k_t]=item['flat_categories'][t] #Categories without keypoints is -1
+                continue #Empty frame, skip
+            keypoints[b,t,:k_t]=item['flat_keypoints'][t]
+            visibility[b,t,:k_t]=True
+            categories[b,t,:k_t]=item['flat_categories'][t]
+    
+    return {
+        'images': images,
+        'padding_mask': padding_mask,
+        'keypoints': keypoints,
+        'visibility': visibility,
+        'categories': categories,
+        'frame_nums': [item['frame_nums'] for item in clip_batch],
+        'px_mul_x': [item['px_mul_x']   for item in clip_batch],
+        'px_mul_y': [item['px_mul_y']   for item in clip_batch],
+        'clip_len': [item['clip_len']    for item in clip_batch],
+        'clip_id': [item['clip_id']    for item in clip_batch],
+        'metadata': [item['metadata']    for item in clip_batch],
+    }
+
+
+   
 
 
 
