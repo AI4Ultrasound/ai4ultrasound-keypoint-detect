@@ -29,7 +29,7 @@ REQUIRED_SCAN_KEYS = (
 
 
 
-########################File Handling Functions#########################
+########################Preprocessing.py Helper Functions#########################
 
 def find_json_for_dicom(dicom_path: str, json_dir: str) -> Optional[str]:
     """Match DICOM to JSON by SOPInstanceUID when possible, else by filename stem."""
@@ -104,13 +104,14 @@ def export_clip_to_png_and_json(input_dicom_path: str,
     scan_params = scanconversion_params_from_annotation(json_data) #Checks for any missing keys in the annotations, and returns annotations that have complete keys
 
     #Init dictionaries that will contain bline and pleura line annotations in mm
-    frame_to_pleura_sector: Dict[int, np.ndarray] = {}
+    frame_to_pleura_sector: Dict[int, List[np.ndarray]] = {}
     frame_to_blines_sector: Dict[int, List[np.ndarray]] = {}
 
     #Fill the annotation dictionaries (in original sector space)
     frame_nos, pleura_list, blists, pleura_ok, _b_ok = parse_all_lines_from_annotation(json_data)
-    for fn, pts, ok in zip(frame_nos, pleura_list, pleura_ok):
-        if ok and pts.size > 0:
+    for fn, pts in zip(frame_nos, pleura_list):
+        good = [p for p in pts if p.size > 0]
+        if good:
             frame_to_pleura_sector[int(fn)] = pts
     for fn, b_list in zip(frame_nos, blists):
         good = [b for b in b_list if b.size > 0]
@@ -139,14 +140,17 @@ def export_clip_to_png_and_json(input_dicom_path: str,
         num_frames = scan_hwc_scanline.shape[0]
 
         #Init the dictionary to hold the annotations in the scanline space
-        frame_to_pleura_out: Dict[int, np.ndarray] = {}
+        frame_to_pleura_out: Dict[int,List[np.ndarray]] = {}
         frame_to_bline_out: Dict[int,List[np.ndarray]]={}
 
         #Read in annotations in scanline space
-        for fn, mm in frame_to_pleura_sector.items():
+        for fn, mm_list in frame_to_pleura_sector.items():
             if fn < 0 or fn >= num_frames:
                 continue
-            frame_to_pleura_out[fn] = pleura_points_curvilinear_mm_to_scanlines(mm, psx, psy, scan_config)
+            converted: List[np.ndarray] = [pleura_points_curvilinear_mm_to_scanlines(mm, psx, psy, scan_config) for mm in mm_list if mm.size>0]
+            
+            if converted:
+                frame_to_pleura_out[fn] = converted
         
         for fn, mm_list in frame_to_blines_sector.items():
             if fn < 0 or fn >= num_frames:
@@ -158,16 +162,21 @@ def export_clip_to_png_and_json(input_dicom_path: str,
     else: #Coordinate space is 'sector'
         num_frames=frames_sector.shape[0]
 
-        frame_to_pleura_out: Dict[int, np.ndarray] = {}
+        frame_to_pleura_out: Dict[int,List[np.ndarray]] = {}
         frame_to_bline_out: Dict[int,List[np.ndarray]]={}
-        for fn, mm in frame_to_pleura_sector.items():
+        for fn, mm_list in frame_to_pleura_sector.items():
             if fn < 0 or fn >= num_frames:
                 continue
-            #Annotations must be in pixel space, so we divide by pixel spacing
-            pts_px = mm.astype(float).copy()
-            pts_px[:, 0] /= psx   # x  (column direction)
-            pts_px[:, 1] /= psy   # y  (row direction)
-            frame_to_pleura_out[fn] = pts_px
+            converted = []
+            for mm in mm_list:
+                if mm.size>0:
+                    #Convert annotations to pixel space, so divide by pixel spacing
+                    pts_px = mm.astype(float).copy()
+                    pts_px[:, 0] /= psx
+                    pts_px[:, 1] /= psy
+                    converted.append(pts_px)
+            if converted:
+                frame_to_pleura_out[fn] = converted
         for fn, mm_list in frame_to_blines_sector.items():
             if fn < 0 or fn >= num_frames:
                 continue
@@ -221,6 +230,8 @@ def export_clip_to_png_and_json(input_dicom_path: str,
             mx = float(im_f.max()) or 1.0
             im_u8 = np.clip(255.0 * im_f / mx, 0, 255).astype(np.uint8)
         
+        #Get image height and width
+        img_h,img_w=im_u8.shape[0],im_u8.shape[1]
         #Saves image:
         Image.fromarray(im_u8).save(img_filename)
 
@@ -236,27 +247,42 @@ def export_clip_to_png_and_json(input_dicom_path: str,
 
         #Handling the annotations and image labels in the output_json file:
         #Handling pleural keypoint annotations
-        pleural_pts=frame_to_pleura_out.get(f)
-        if pleural_pts is not None and pleural_pts.size>0:
-            output_json["annotations"].append({
-                "id":ann_id, #Unique annotation ID via running counter
-                "frame_num": f,
-                "category_id": CLASS_ID_PLEURAL_LINE,
-                "keypoints": pleural_pts.tolist(),
-                })   
-            ann_id+=1             
+        pleural_pts_list=frame_to_pleura_out.get(f,[])
+
+        #First, compute the deepest pleural line (the line whose y-value is the largest) which will be passed to the b-line bonding box calculater to set the top of the b-line
+        if pleural_pts_list:
+            deepest_pleural_pts = max(pleural_pts_list,key=lambda pts: float(np.max(pts[:, 1])))
+        else:
+            deepest_pleural_pts=None
+
+        for pleural_pts in pleural_pts_list:
+            if pleural_pts is not None and pleural_pts.size>0:
+                #Get the bounding box list ([xmin,ymin,w,h])
+                bboxes=pleural_scanline_to_bbox(pleural_pts,img_w,img_h,min_side_px=5.0) #Creates a bounding box based on a min_side_px 
+                if bboxes:
+                    output_json["annotations"].append({
+                        "id":ann_id, #Unique annotation ID via running counter
+                        "frame_num": f,
+                        "category_id": CLASS_ID_PLEURAL_LINE,
+                        "keypoints": pleural_pts.tolist(),
+                        "bbox":bboxes,
+                        })   
+                    ann_id+=1             
 
         #Handling bline keypoint annotations
         bline_pts_list=frame_to_bline_out.get(f,[]) 
         for pts_b in bline_pts_list:
             if pts_b is not None and pts_b.size>0:
-                output_json["annotations"].append({
-                    "id": ann_id, #Just the frame number
-                    "frame_num": f,
-                    "category_id": CLASS_ID_B_LINE,
-                    "keypoints": pts_b.tolist(),
-                   })
-                ann_id+=1
+                bboxes_bline=bline_scanline_to_bbox(pts_b,deepest_pleural_pts,img_w,img_h,gap_below_pleura_px=1.0)
+                if bboxes_bline:
+                    output_json["annotations"].append({
+                        "id": ann_id, #Just the frame number
+                        "frame_num": f,
+                        "category_id": CLASS_ID_B_LINE,
+                        "keypoints": pts_b.tolist(),
+                        "bbox":bboxes_bline,
+                    })
+                    ann_id+=1
         
     #Save the json to its annotation folder
     with open(lbl_filename,"w",encoding="utf-8") as file:
@@ -265,10 +291,95 @@ def export_clip_to_png_and_json(input_dicom_path: str,
     
 
         
-        
+def pleural_scanline_to_bbox(pleural_pts,img_w,img_h,min_side_px=5.0):
+    '''
+    Reads in the set of pleural_pts for a given frame, and returns a bounding box for the pleural line.
+    Input:
+        - pleural_pts: pleural points for a given frame. Size (N,2) Where N is number of pleural points in a given frame, and 2 is for x and y axis
+        - img_w, img_h: image width and height
+        - min_size_px: Minimum size of the bounding box in pixels
+    Output:
+        - pleura_bbox=[xmin,ymin,w,h], where xmin and ymin is the corner pixel
+    '''
+    #Gets the min and max values for the pleural points for both the x and y dimensions
+    lines = pleural_pts[:, 0].astype(float)
+    samples = pleural_pts[:, 1].astype(float)
+    xmin, xmax = float(np.min(lines)), float(np.max(lines))
+    ymin, ymax = float(np.min(samples)), float(np.max(samples))
+
+    w,h=xmax-xmin,ymax-ymin
+    if w<0 or h<0:
+        return []
+    
+    #Adjusts width if the width or height is smaller than the minimum pixel size
+    if w < min_side_px:
+        pad= (min_side_px - w) / 2
+        xmin -= pad
+        xmax += pad
+    if h < min_side_px:
+        pad = (min_side_px - h) / 2
+        ymin -= pad
+        ymax += pad
+    
+    #Clips bbox based on image size
+    img_max_x = float(img_w - 1)
+    img_max_y = float(img_h - 1)
+    xmin = float(np.clip(xmin, 0.0, img_max_x))
+    xmax = float(np.clip(xmax, 0.0, img_max_x))
+    ymin = float(np.clip(ymin, 0.0, img_max_y))
+    ymax = float(np.clip(ymax, 0.0, img_max_y))
+    
+    #Checks that max is always bigger than min
+    if xmax < xmin or ymax < ymin:
+        return []
+    
+    #Compute new bbox width and height
+    w=xmax-xmin
+    h=ymax-ymin
+
+    return [xmin,ymin,w,h] #COCO bbox format
+
+def bline_scanline_to_bbox(pts_b,deepest_pleural_pts,img_w,img_h,gap_below_pleura_px=1.0):
+    '''
+    Takes in the B-line keypoints (either side of the b-line) and computes a bounding box for the B-line.
+    Input:
+        - pts_b: b-line points for a given frame. Size (M,2) Where M is number of bline points in a given frame, and 2 is for x and y axis
+        - deepest_pleural_pts: pleural points for a given frame. Size (N,2) Where N is number of pleural points in a given frame, and 2 is for x and y axis
+        - img_w, img_h: image width and height
+    Output:
+        - bline_bbox=[xmin,ymin,w,h] 
+    '''
+    if pts_b.size==0:
+        return []
+    
+    lines = pts_b[:, 0].astype(float)
+    xmin, xmax = float(np.min(lines)), float(np.max(lines))
+
+    #Compute the top of the b-line bounding box, which is just below the pleura's deepest point on the frame
+    if deepest_pleural_pts is not None and deepest_pleural_pts.size>0: 
+        pleura_samples=deepest_pleural_pts[:,1].astype(float) #Gets the y elements of the pleural line
+        pleura_ymax=float(np.max(pleura_samples)) #Gets the max pleural height
+        y_top=pleura_ymax+float(gap_below_pleura_px) #Computes the top as the max pleura plus the gap
+    else:
+        y_top=float(np.min(pts_b[:,1])) #Fallback is the top of the bounding box
+    
+    if y_top>=img_h: #If the top of the bline bbox is heigher than the image height, then return empty list
+        return []
+    
+    #Along horizontal, clip to the image widht
+    img_max_x=float(img_w - 1)
+    xmin = float(np.clip(xmin, 0.0, img_max_x))
+    xmax = float(np.clip(xmax, 0.0, img_max_x))
+
+    y_top=min(y_top,img_h-1)
+
+    w=xmax-xmin
+    h=img_h-y_top #Bounding box goes all the way to bottom of image
+    if w<1e-9 or h<1e-9:
+        return []
+    return [xmin,y_top,w,h]
 
 
-########################Helper Functions (for internal utils use)########################
 
 def load_annotation_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -330,13 +441,13 @@ def parse_all_lines_from_annotation(
     data: Dict[str, Any],
     *,
     require_non_empty_line: bool = True,
-) -> Tuple[List[int], List[np.ndarray], List[List[np.ndarray]], List[bool], List[bool]]:
+) -> Tuple[List[int], List[List[np.ndarray]], List[List[np.ndarray]], List[bool], List[bool]]:
     """
     Pleura (first line only) plus **all** B-line polylines per frame.
 
     Returns:
         frame_numbers
-        pleura_points_mm: one (N,2) array per frame (empty if none)
+        pleura_points_mm: list per frame of zero or more (N,2) array per frame
         b_lines_points_mm: list per frame of zero or more (N,2) arrays
         pleura_valid: first pleura line usable
         b_lines_valid: at least one usable B-line on that frame
@@ -346,7 +457,7 @@ def parse_all_lines_from_annotation(
         raise ValueError("Annotation JSON has no list 'frame_annotations'.")
 
     frame_numbers: List[int] = []
-    pleura_mm: List[np.ndarray] = []
+    pleura_mm: List[List[np.ndarray]] = []
     blines_mm: List[List[np.ndarray]] = []
     pleura_ok: List[bool] = []
     b_ok: List[bool] = []
@@ -359,11 +470,11 @@ def parse_all_lines_from_annotation(
         fn = int(entry["frame_number"])
         frame_numbers.append(fn)
 
-        p_arr, p_valid = _first_polyline_mm_from_entry(
-            entry, "pleura_lines", require_non_empty_line=require_non_empty_line
+        p_list = _polylines_mm_from_lines_field(
+            entry.get("pleura_lines") or [], require_non_empty_line=require_non_empty_line
         )
-        pleura_mm.append(p_arr)
-        pleura_ok.append(p_valid)
+        pleura_mm.append(p_list)
+        pleura_ok.append(len(p_list) > 0)
 
         b_list = _polylines_mm_from_lines_field(
             entry.get("b_lines") or [], require_non_empty_line=require_non_empty_line
@@ -584,6 +695,14 @@ def curvilinear_to_scanlines_coordinates(
         points_scanlines[i, 1] = sample
 
     return points_scanlines
+
+
+
+
+
+
+
+
 
 ####################Clip Sequence Handling Functions#############
 def clip_collate_fn_base(clip_batch):
