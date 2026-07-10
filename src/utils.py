@@ -112,7 +112,7 @@ def export_clip_to_png_and_json(input_dicom_path: str,
     for fn, pts in zip(frame_nos, pleura_list):
         good = [p for p in pts if p.size > 0]
         if good:
-            frame_to_pleura_sector[int(fn)] = pts
+            frame_to_pleura_sector[int(fn)] = good
     for fn, b_list in zip(frame_nos, blists):
         good = [b for b in b_list if b.size > 0]
         if good:
