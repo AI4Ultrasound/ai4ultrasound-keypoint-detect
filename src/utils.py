@@ -265,7 +265,7 @@ def export_clip_to_png_and_json(input_dicom_path: str,
                         "frame_num": f,
                         "category_id": CLASS_ID_PLEURAL_LINE,
                         "keypoints": pleural_pts.tolist(),
-                        "bbox":bboxes,
+                        "bboxes":bboxes,
                         })   
                     ann_id+=1             
 
@@ -280,7 +280,7 @@ def export_clip_to_png_and_json(input_dicom_path: str,
                         "frame_num": f,
                         "category_id": CLASS_ID_B_LINE,
                         "keypoints": pts_b.tolist(),
-                        "bbox":bboxes_bline,
+                        "bboxes":bboxes_bline,
                     })
                     ann_id+=1
         

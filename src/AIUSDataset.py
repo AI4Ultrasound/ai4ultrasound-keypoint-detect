@@ -22,7 +22,8 @@ _CASH_DIR_ROOT_NAME='../../../Data/usframecache' #Where we store the cashed, pro
 
 class AIUSDataset(Dataset):
     def __init__(self,json_paths,us_framesize=None,line_type='both',normalize_method='basic',
-                 resampling_freq=None,convert_to_gray=True,img_augmentations=None,aug_prob=0.1, return_mode='frame'):
+                 resampling_freq=None,convert_to_gray=True,img_augmentations=None,aug_prob=0.1, return_mode='frame',
+                 return_annotation_dim=False):
         """
         json_paths (list of str): paths to annotation files for each clip in this data split
         us_framesize (None or tuple): resize US frame to these dimensions, or None means no resizing
@@ -44,6 +45,9 @@ class AIUSDataset(Dataset):
             - 'frame' __getitem__ returns a single (C,H,W) image + its annotations
             - 'clip' __getitem__ returns the full sequence for a clip (T,C,H,W) + all per-frame annotations. Used for RNN/temporal models. Clips have variable T
             so use the collate_fn when constructing dataloader.
+        return_annotation_dim (bool):
+            - True: return tensors in _getitem_ and _index_clip with the annotation and keypoints as separate dimensions (N_a,K_i)
+            - False: returned tensors in _getitem_ and _index_clip only with annotation and keypoints as the same dimension (K=N_a*K_i)
 
 
         Description: init method does the following operations in following order:
@@ -101,6 +105,7 @@ class AIUSDataset(Dataset):
         self.return_mode=return_mode
         self.stats_for_normalization_gpu={} #This will hold stats as tensors that are used on the GPU for unormalization
         self.aug_prob=aug_prob
+        self.return_annotation_dim=return_annotation_dim
 
         #Convert the line type to the class ID number
         if self.line_type=='bline':
@@ -832,7 +837,8 @@ class AIUSDataset(Dataset):
 
             #Loops for all the entries (frames) in the clip
             for entry in record['frame_entries']:
-                fn=entry['frame_num']
+
+                fn=entry['frame_num'] #Gets the frame number
                 cache_path=os.path.join(cache_dir,f'frame_{fn:05d}.npy') #Where we store the final ultrasound image
                 if not os.path.isfile(cache_path):
                     continue
@@ -841,22 +847,51 @@ class AIUSDataset(Dataset):
                 keypoints  = [
                     torch.tensor(np.array(a['keypoints'], dtype=np.float32))
                     for a in entry['annotations']
-                ]
-                categories = torch.tensor([a['category_id'] for a in entry['annotations']],dtype=torch.long) 
-                kp_counts=sum(ann.shape[0] for ann in keypoints)
-                #Saves the results, sample_index is the main object that we call from in _getitem_
-                self.sample_index.append({
-                    'cache_path':    cache_path,
-                    'keypoints':     keypoints,   # List[ndarray (N_i, 2)] — variable length
-                    'categories':    categories,  # List[int]
-                    'kp_counts':     kp_counts, 
-                    'frame_num':     fn,
-                    'px_mul_x':      entry['px_mul_x'],
-                    'px_mul_y':      entry['px_mul_y'],
-                    'clip_id':       record['stem'],
-                    'clip_metadata': record['clip_metadata'],
-                })
+                ] #Loops for each annotation in the frame and stores as list of torch tensors
 
+                categories = torch.tensor([a['category_id'] for a in entry['annotations']],dtype=torch.long) 
+                
+
+                #Gets the bounding boxes for each corresponding keypoint
+                bboxes=[
+                    torch.tensor(np.array(a['bbox'],dtype=np.float32))
+                    for a in entry ['annotations']
+                ]
+
+                areas=torch.tensor([a['bbox'][2]*a['bbox'][3] for a in entry['annotations']],dtype=torch.float32) 
+
+                #Saves the results, sample_index is the main object that we call from in _getitem_                
+                #In comments below, N_a=number of annotations, K_i=number of keypoints in annotation
+                if self.return_annotation_dim: #Returns tensors with annotation dim:
+                    kp_counts=sum(ann.shape[0] for ann in keypoints) #Number of keypoints for this frame
+                    self.sample_index.append({
+                        'cache_path':    cache_path,
+                        'keypoints':     keypoints,   # List[ndarray (K_i, 2)] — (N_a,K_i,2) 
+                        'bboxes': bboxes, #List[ndarray (K_i, 4)] — (N_a,K_i,4)
+                        'areas': areas, #List[float] - (N_a,) float of areas, one per annotation
+                        'categories':    categories,  # List[int]  - (N_a) category per annotation
+                        'kp_counts':     kp_counts, #int 
+                        'frame_num':     fn,    #int
+                        'px_mul_x':      entry['px_mul_x'], #float
+                        'px_mul_y':      entry['px_mul_y'], #float
+                        'clip_id':       record['stem'], #str
+                        'clip_metadata': record['clip_metadata'], #dict
+                    })
+                else: #Does not return annotation dim
+                    flat_kps,flat_bbs,flat_areas,flat_cats,kp_counts=self._build_flat_tensors(keypoints,bboxes,areas,categories)
+                    self.sample_index.append({
+                        'cache_path':    cache_path,
+                        'keypoints':     flat_kps,   # (K,2) 
+                        'bboxes': flat_bbs, #(K,4) one per keypoint
+                        'areas': flat_areas, #(K,) one per keypoint
+                        'categories':    flat_cats,  # (K,) one per keypoint
+                        'kp_counts':     kp_counts, #int 
+                        'frame_num':     fn,    #int
+                        'px_mul_x':      entry['px_mul_x'], #float
+                        'px_mul_y':      entry['px_mul_y'], #float
+                        'clip_id':       record['stem'], #str
+                        'clip_metadata': record['clip_metadata'], #dict
+                    })
         else:
             #clip level, so we collect all valid frames and append as a single entry to sample_index
 
@@ -864,9 +899,12 @@ class AIUSDataset(Dataset):
             clip_cache_paths = []
             clip_keypoints   = []
             flat_keypoints = [] #(T,K,2)
+            clip_bboxes=[]
+            flat_bboxes=[]
+            clip_areas=[]
+            flat_areas=[]
             clip_categories  = []
             flat_categories = [] #(T,K)
-            flat_areas=[] #(T,K) Area for each keypoint
             clip_kp_counts = [] #Holds the area for each keypoint set as a bounding box
             clip_frame_nums  = []
             clip_px_mul_x    = []
@@ -885,56 +923,116 @@ class AIUSDataset(Dataset):
 
                 categories = torch.tensor([a['category_id'] for a in entry['annotations']],dtype=torch.long)
                 
-                #Compute flat keypoints which are all the annotations concatenated (remove the annotation dimension)
-                if len(keypoints)<1:
-                    flat_keypoints.append(torch.zeros(0,2)) #Empty annotation list
-                    flat_categories.append(torch.tensor(-1,dtype=torch.long)) #-1 for no category
+                #Gets the bounding boxes for each corresponding keypoint
+                bboxes=[
+                    torch.tensor(np.array(a['bbox'],dtype=np.float32))
+                    for a in entry ['annotations']
+                ]
 
+                #Gets the areas for each bbox
+                areas=torch.tensor([a['bbox'][2]*a['bbox'][3] for a in entry['annotations']],dtype=torch.float32) 
+
+                if self.return_annotation_dim: #We preserve the annotation dimension
+                    #Compute number of keypoints
+                    clip_kp_counts.append(sum(ann.shape[0] for ann in keypoints)) #Computes total keypoints for this frame
+                    clip_cache_paths.append(cache_path)
+                    clip_keypoints.append(keypoints)
+                    clip_bboxes.append(bboxes)
+                    clip_areas.append(areas)
+                    clip_categories.append(categories)
+                    clip_frame_nums.append(fn)
+                    clip_px_mul_x.append(entry['px_mul_x'])
+                    clip_px_mul_y.append(entry['px_mul_y'])
                 else:
-                    #Flatten annotations for this frame
-                    flat_keypoints.append(torch.cat(keypoints,dim=0)) #(K,2)
-                    #Expand categories so for N annotations => K keypoints
-                    flat_categories.append(torch.cat([
-                        categories[ann_idx].expand(ann_kps.shape[0])
-                        for ann_idx,ann_kps in enumerate(keypoints)
-                    ]))
-
-                    #Compute the areas for the keypoints
-                    flat_areas.append(torch.cat())
+                    #Doing per-keypoint elements
                 
-                #Compute number of keypoints
-                clip_kp_counts.append(sum(ann.shape[0] for ann in keypoints)) #Computes total keypoints for this frame
+                    #compute the flattened returned elements (per keypoint elements, K)
+                    flat_kps,flat_bbs,flat_ar,flat_cats,kp_cnt=self._build_flat_tensors(keypoints,bboxes,areas,categories)
 
-                clip_cache_paths.append(cache_path)
-                clip_keypoints.append(keypoints)
-                clip_categories.append(categories)
-                clip_frame_nums.append(fn)
-                clip_px_mul_x.append(entry['px_mul_x'])
-                clip_px_mul_y.append(entry['px_mul_y'])
-
-            #Append the clip-level entry to sample_index
+                    #Appending to lists
+                    clip_cache_paths.append(cache_path)
+                    flat_keypoints.append(flat_kps)
+                    flat_bboxes.append(flat_bbs)
+                    flat_areas.append(flat_ar)
+                    flat_categories.append(flat_cats)
+                    clip_kp_counts.append(kp_cnt)
+                    clip_frame_nums.append(fn)
+                    clip_px_mul_x.append(entry['px_mul_x'])
+                    clip_px_mul_y.append(entry['px_mul_y'])
+            
             if not clip_cache_paths:
                 return #No valid frames for this clip
             
             
 
-            
-            #T=number of frames in clip
-            self.sample_index.append({
-            'cache_paths':   clip_cache_paths,   # List[str] length T
-            'keypoints':     clip_keypoints,     # List[List[ndarray]] (T, K_t, N_i, 2)
-            'flat_keypoints': flat_keypoints,
-            'categories':    clip_categories,    # List[List[int]] (T, K_t)
-            'flat_categories': flat_categories,
-            'kp_counts': clip_kp_counts, #List[int] length T
-            'frame_nums':    clip_frame_nums,    # List[int] length T
-            'px_mul_x':      clip_px_mul_x,      # List[float] length T
-            'px_mul_y':      clip_px_mul_y,      # List[float] length T
-            'clip_id':       record['stem'],
-            'clip_metadata': record['clip_metadata'],
-            })
+            if self.return_annotation_dim: #Return the annotation dimension
+                #T=number of frames in clip
+                # N_a=number of annotations, K_i=number of keypoints in annotation
+                # K=N_a * K_i = # of keypoints in frame
+                self.sample_index.append({
+                'cache_paths':   clip_cache_paths,   # List[str] length T
+                'keypoints':     clip_keypoints,     # List[List[ndarray]] (T, N_a, K_i, 2)
+                'bboxes': clip_bboxes,  #(T, N_a, K_i, 4)
+                'areas': clip_areas, #(T,N_a,) float of areas, one per annotation per frame
+                'categories':    clip_categories,    # List[List[int]] (T, N_a)
+                'kp_counts': clip_kp_counts, #List[int] length T
+                'frame_nums':    clip_frame_nums,    # List[int] length T
+                'px_mul_x':      clip_px_mul_x,      # List[float] length T
+                'px_mul_y':      clip_px_mul_y,      # List[float] length T
+                'clip_id':       record['stem'], #str 
+                'clip_metadata': record['clip_metadata'],
+                })
+            else:
+                #T=number of frames in clip
+                # N_a=number of annotations, K_i=number of keypoints in annotation
+                # K=N_a * K_i = # of keypoints in frame
+                self.sample_index.append({
+                'cache_paths':   clip_cache_paths,   # List[str] length T
+                'keypoints': flat_keypoints, #(T,K,2)
+                'bboxes':flat_bboxes, #(T,K,4)
+                'areas': flat_areas, #(T,K) one annotation per keypoint
+                'categories': flat_categories, #(T,K)
+                'kp_counts': clip_kp_counts, #List[int] length T
+                'frame_nums':    clip_frame_nums,    # List[int] length T
+                'px_mul_x':      clip_px_mul_x,      # List[float] length T
+                'px_mul_y':      clip_px_mul_y,      # List[float] length T
+                'clip_id':       record['stem'], #str 
+                'clip_metadata': record['clip_metadata'],
+                })
 
-    
+    def _build_flat_tensors(self,kp_tensors,bbox_tensors,areas_tensor,cats_tensor):
+        """
+        Given a list of annotation dicts for one frame, return flat tensors
+        Output: flat_keypoints, flat_bboxes, flat_areas, flat_categories, kp_counts
+        """
+        if not kp_tensors: #Empty annotation
+            return(
+                torch.zeros(0,2,dtype=torch.float32), #flat_keypoints
+                torch.zeros(0,4,dtype=torch.float32), #flat_bboxes
+                torch.zeros(0,dtype=torch.float32), #flat_areas
+                torch.full((0,), -1, dtype=torch.long), #flat_categories
+                0, #kp_counts
+            )
+        
+        #Flatten annotations for this frame
+        flat_keypoints=torch.cat(kp_tensors,dim=0) #(K,2)
+        flat_bboxes=torch.cat([
+                        bbox_tensors[i].unsqueeze(0).expand(kp_tensors[i].shape[0],-1)
+                        for i in range(len(kp_tensors))
+                    ],dim=0) #(K,4)
+        flat_areas = torch.cat([
+            torch.full((kp_tensors[i].shape[0],), areas_tensor[i].item(), dtype=torch.float32)
+            for i in range(len(kp_tensors))
+        ])  # (K,)
+
+        flat_categories = torch.cat([
+            torch.full((kp_tensors[i].shape[0],), cats_tensor[i].item(), dtype=torch.long)
+            for i in range(len(kp_tensors))
+        ])  # (K,)
+
+        kp_counts = flat_keypoints.shape[0]
+        return flat_keypoints,flat_bboxes,flat_areas,flat_categories,kp_counts
+        
     ##################Norm Stats Cache Helpers################
     def _norm_stats_cache_path(self,json_path):
         """
@@ -985,31 +1083,62 @@ class AIUSDataset(Dataset):
     def __getitem__(self, idx):
         """
         if return_mode=='frame' => returns a single frame dict with:
-            'image'      : FloatTensor (C, H, W)
-            'keypoints'  : list[FloatTensor (N_i, 2)]
-            'categories' : LongTensor (K,)
-            'kp_counts'  : int
-            'frame_num'  : int
-            'px_mul_x'   : float
-            'px_mul_y'   : float
-            'clip_id'    : str
-            'metadata'   : dict
+            if return_annotation_dim==True:
+                'image'      : FloatTensor - (C, H, W)
+                'keypoints'  : list[FloatTensor (K_i, 2)] - (N_a,K_i,2) 
+                'bboxes'     : List[FloatTensor (K_i, 4)] — (N_a,K_i,4)
+                'areas'      : List[FloatTensor (K_i)] - (N_a,K_i)
+                'categories' : LongTensor (N_a,)
+                'kp_counts'  : int
+                'frame_num'  : int
+                'px_mul_x'   : float
+                'px_mul_y'   : float
+                'clip_id'    : str
+                'metadata'   : dict
+            else:
+                'image'      : FloatTensor - (C, H, W)
+                'keypoints'  : List[FloatTensor (K,2) 
+                'bboxes'     : List[FloatTensor (K,4)
+                'areas'      : List[FloatTensor (K)
+                'categories' : LongTensor (K,)
+                'kp_counts'  : int
+                'frame_num'  : int
+                'px_mul_x'   : float
+                'px_mul_y'   : float
+                'clip_id'    : str
+                'metadata'   : dict
 
         if return_mode=='clip' => returns a single clip dict with:
-            'images'     : FloatTensor (T, C, H, W)  — padded if using collate_fn
-            'keypoints'  : list[list[FloatTensor (N_i, 2)]]  — shape (T, N_i,K_t,2)
-            'flat_keypoints': shape (T,K,2) #K=N_i*K_t
-            'categories' : list[LongTensor (K_t,)]  — one tensor per frame
-            'flat_categories: shape (T,K) K=N_i*K_t
-            'kp_counts'  : list[int] length T
-            'frame_nums' : list[int] length T
-            'px_mul_x'   : list[float] length T
-            'px_mul_y'   : list[float] length T
-            'clip_len'   : int  — actual (un-padded) number of frames T
-            'clip_id'    : str
-            'metadata'   : dict
+            if return_annotation_dim==True:
+                'images'     : FloatTensor - (T, C, H, W) 
+                'keypoints'  : list[list[FloatTensor (K_i, 2)]]  — (T, N_a,K_i,2)
+                'bboxes'     : (T, N_a, K_i, 4)
+                'areas'      : (T,N_a,K_i)
+                'categories' : list[LongTensor (N_a,)]  — (T, N_a)
+                'kp_counts'  : list[int] length T
+                'frame_nums' : list[int] length T
+                'px_mul_x'   : list[float] length T
+                'px_mul_y'   : list[float] length T
+                'clip_len'   : int  — actual (un-padded) number of frames T
+                'clip_id'    : str
+                'metadata'   : dict
+            else:
+                'images'     : FloatTensor - (T, C, H, W) 
+                'keypoints': shape (T,K,2)
+                'bboxes': (T,K,4)
+                'areas' : (T,K)
+                'categories: (T,K)
+                'kp_counts'  : list[int] length T
+                'frame_nums' : list[int] length T
+                'px_mul_x'   : list[float] length T
+                'px_mul_y'   : list[float] length T
+                'clip_len'   : int  — actual (un-padded) number of frames T
+                'clip_id'    : str
+                'metadata'   : dict
 
-        T=number of frames in the clip, K_t=number of annotations in frame t, N_i=number of keypoints in annotation i
+        T=number of frames in the clip, N_a=number of annotations in frame t
+        K_i=number of keypoints in annotation a
+        K=N_a*K_i=number of keypoints in frame
         !!!!!!!!!!!!No tensors are on device, handle this in model trainer!!!!!!!!!!
         """
         if self.return_mode == 'frame':
@@ -1038,6 +1167,8 @@ class AIUSDataset(Dataset):
         return {
         'image':      image,
         'keypoints':  sample['keypoints'],
+        'bboxes': sample['bboxes'],
+        'areas': sample['areas'],
         'categories': sample['categories'],
         'kp_counts':  sample['kp_counts'],
         'frame_num':  sample['frame_num'],
@@ -1072,9 +1203,9 @@ class AIUSDataset(Dataset):
         return {
             'images':     images,
             'keypoints':  sample['keypoints'],
-            'flat_keypoints': sample['flat_keypoints'],
+            'bboxes': sample['bboxes'],
+            'areas': sample['areas'],
             'categories': sample['categories'],
-            'flat_categories': sample['flatcategories'],
             'kp_counts':  sample['kp_counts'], #List[int] of length T
             'frame_nums': sample['frame_nums'],
             'px_mul_x':   sample['px_mul_x'],
