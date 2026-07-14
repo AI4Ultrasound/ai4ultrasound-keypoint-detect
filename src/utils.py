@@ -707,6 +707,7 @@ def curvilinear_to_scanlines_coordinates(
 ####################Clip Sequence Handling Functions#############
 def clip_collate_fn_base(clip_batch):
     """
+    !!!Depricated, not using right now!!!!!!!!!
     Collate function for when return_mode=='clip' in the AIUSDataset class.
     Images are padded to T_max, keypoints and categories are kept as ragged Python lists.
     e.g., there is no K_max padding. Use pad_keypoints_for_loss() before calling the loss function
@@ -752,6 +753,7 @@ def clip_collate_fn_base(clip_batch):
 
 def clip_collate_fn_fullpad(clip_batch):
     """
+    To be used when loading in data with a torch dataloader for clip-based prediction.
     Collate function that pads to T_max (max time dimension) and to max keypoints (K_max).
     """
     B=len(clip_batch) #Num of batches
@@ -767,6 +769,8 @@ def clip_collate_fn_fullpad(clip_batch):
     #Pre-allocate tensors
     images=torch.zeros(B,max_t,C,H,W,dtype=torch.float32)
     keypoints=torch.zeros(B,max_t,K_max,2,dtype=torch.float32)
+    bboxes=torch.zeros(B,max_t,K_max,4,dtype=torch.float32)
+    areas=torch.zeros(B, max_t, K_max,dtype=torch.float32)
     visibility=torch.zeros(B,max_t,K_max,dtype=torch.bool) #Visibility of keypoints
     categories=torch.full((B, max_t, K_max), -1, dtype=torch.long)
     padding_mask=torch.zeros(B,max_t,dtype=torch.bool)
@@ -782,18 +786,23 @@ def clip_collate_fn_fullpad(clip_batch):
         for t in range(T): #Loops for all frames in this clip
             k_t=item['kp_counts'][t] #Gets number of keypoints for this frame
             if k_t==0:
-                categories[b,t,:k_t]=item['flat_categories'][t] #Categories without keypoints is -1
+                categories[b,t,:k_t]=item['categories'][t] #Categories without keypoints is -1
                 continue #Empty frame, skip
-            keypoints[b,t,:k_t]=item['flat_keypoints'][t]
+            keypoints[b,t,:k_t]=item['keypoints'][t]
+            bboxes[b,t,:k_t]=item['bboxes'][t]
+            areas[b,t,:k_t]=item['areas'][t]
             visibility[b,t,:k_t]=True
-            categories[b,t,:k_t]=item['flat_categories'][t]
+            categories[b,t,:k_t]=item['categories'][t]
     
     return {
         'images': images,
         'padding_mask': padding_mask,
         'keypoints': keypoints,
+        'bboxes': bboxes,
+        'areas':areas,
         'visibility': visibility,
         'categories': categories,
+        'kp_counts': [item['kp_counts'] for item in clip_batch],
         'frame_nums': [item['frame_nums'] for item in clip_batch],
         'px_mul_x': [item['px_mul_x']   for item in clip_batch],
         'px_mul_y': [item['px_mul_y']   for item in clip_batch],
@@ -805,7 +814,49 @@ def clip_collate_fn_fullpad(clip_batch):
 
    
 
+def frame_collate_fn(frame_batch):
+    '''
+    Adds the visibility variable to the return list
+    and pads to max keypoints (K_max) in the batch.
+    frame_batch has shape: (B,C,H,W)
+    To be used when loading in data with a torch dataloader for frame-based prediction.
+    '''
+    B=len(frame_batch) #Num of batches
 
+    #Compute number of keypoints across all frames in the batch
+    batch_counts=[item['kp_counts'] for item in frame_batch] #Loops for all keypoint counts across batch
+    K_max=max(batch_counts)
+    K_max=max(K_max,1)
+
+    keypoints=torch.zeros(B,K_max,2,dtype=torch.float32)
+    bboxes=torch.zeros(B,K_max,4,dtype=torch.float32)
+    areas=torch.zeros(B,  K_max,dtype=torch.float32)
+    visibility=torch.zeros(B,K_max,dtype=torch.bool) #Visibility of keypoints
+    categories=torch.full((B,K_max), -1, dtype=torch.long)
+
+    for b,item in enumerate(frame_batch):
+        k_t=item['kp_counts'] #Gets number of keypoints for this frame
+        if k_t==0:
+            continue #Empty frame, skip
+        keypoints[b,:k_t]=item['keypoints']
+        bboxes[b,:k_t]=item['bboxes']
+        areas[b,:k_t]=item['areas']
+        visibility[b,:k_t]=True
+        categories[b,:k_t]=item['categories']
+    return {
+        'images': torch.stack([item['image'] for item in frame_batch]),
+        'keypoints': keypoints,
+        'bboxes': bboxes,
+        'areas':areas,
+        'visibility': visibility,
+        'categories': categories,
+        'kp_counts': [item['kp_counts'] for item in frame_batch],
+        'frame_nums': [item['frame_num'] for item in frame_batch],
+        'px_mul_x': [item['px_mul_x']   for item in frame_batch],
+        'px_mul_y': [item['px_mul_y']   for item in frame_batch],
+        'clip_id': [item['clip_id']    for item in frame_batch],
+        'metadata': [item['metadata']    for item in frame_batch],
+    }
 
 
 #############################Dataclasses######################

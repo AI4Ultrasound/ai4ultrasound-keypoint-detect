@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from tqdm import trange, tqdm
+import os
 
 
 class ModelTrainer(nn.Module):
@@ -25,7 +26,16 @@ class ModelTrainer(nn.Module):
         self.checkpoint_savedir=checkpoint_savedir
         self.model_name_save=model_name_save
         self.model_name_load=model_name_load
+        #Create the checkpoint savepath
+        self.checkpoint_savepath=os.path.join(checkpoint_savedir,model_name_save+ '.pt') if checkpoint_savedir else None
 
+        #Create a different savepath if this exists
+        num_val=0
+        while os.path.exists(self.checkpoint_savepath):
+            self.checkpoint_savepath=os.path.join(checkpoint_savedir,model_name_save+'_'+str(num_val)+'.pt') if checkpoint_savedir else None
+            num_val+=1
+            
+        self.checkpoint_loadpath=os.path.join(checkpoint_savedir,model_name_load+'.pt') if checkpoint_savedir else None
 
         self.start_epoch=0
         self.best_valid_loss=float(10000.0) #Keep model with best validation loss
@@ -45,14 +55,16 @@ class ModelTrainer(nn.Module):
                 #Load the data
                 if self.return_mode=='frame':
                     us_frames=data['images'].to(self.device,non_blocking=True) #(B, C, H, W)
-                    target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,list[N_t,K_i,2]) where N_t=# of annotations/frame and K_i=number of keypoints per annotation
-                    categories=data['categories'].to(self.device,non_blocking=True)  #(B,N_t)
-                    px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul)
+                    target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,K,2) where K=number of keypoints
+                    target_areas=data['areas'].to(self.device,non_blocking=True) #(B,K)
+                    target_visibility=data['visibility'].to(self.device,non_blocking=True)
+                    target_categories=data['categories'].to(self.device,non_blocking=True)  #(B,K)
+                    px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul), size (B)
                     px_mul_y=data['px_mul_y']
 
                     #Gets prediction and runs the loss
-                    pred_keypoints=self.model(us_frames)
-                    loss=self.loss_fun(pred_keypoints,target_keypoints)
+                    pred_keypoints,pred_categories=self.model(us_frames)
+                    loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories)
 
                 if self.return_mode=='clip': #Using the clip_collate_fn return where we pad the end of the time dimension with zeros
                     us_frames=data['images'].to(self.device,non_blocking=True) #(B,T, C, H, W)
@@ -69,23 +81,23 @@ class ModelTrainer(nn.Module):
 
                     #Get target keypoints, visibiity and categories
                     target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,T,K_max,2)  
-                    areas=data['areas'].to(self.device,non_blocking=True)  #(B,T,K)
-                    visibility=data['visbility'].to(self.device,non_blocking=True) #(B,T,K_max)
-                    categories=data['categories'].to(self.device,non_blocking=True) #(B,T,K_max)
+                    target_areas=data['areas'].to(self.device,non_blocking=True)  #(B,T,K)
+                    target_visibility=data['visbility'].to(self.device,non_blocking=True) #(B,T,K_max)
+                    target_categories=data['categories'].to(self.device,non_blocking=True) #(B,T,K_max)
 
-                    visibility=visibility & padding_mask.unsqueeze(-1) #mask out any visibility for frames which have been padded
+                    target_visibility=target_visibility & padding_mask.unsqueeze(-1) #mask out any visibility for frames which have been padded
 
                     if not visibility.any():
-                        del us_frames,padding_mask, target_keypoints,visibility,categories
+                        del us_frames,padding_mask, target_keypoints,target_visibility,target_categories,target_areas
                         continue
 
                     #Gets the loss
-                    loss=self.loss_fun(pred_keypoints,target_keypoints,visibility,areas,categories)
+                    loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories)
                 
 
                 if torch.isnan(loss):
                     self.optimizer.zero_grad()
-                    del us_frames, target_keypoints,categories,loss
+                    del us_frames, target_keypoints,target_areas,target_visibility,target_categories,loss
                     continue
                 else:
                     #Backpropagation
@@ -98,12 +110,15 @@ class ModelTrainer(nn.Module):
                         if isinstance(self.LR_scheduler,torch.optim.lr_scheduler.OneCycleLR):
                             self.LR_scheduler.step() #Step every batch for one cycle lr
 
-                    #Detach pred_keypoints and target_keypoints from computational graph
+                    #Detach from computational graph
                     pred_keypoints=pred_keypoints.detach()
                     target_keypoints=target_keypoints.detach()
+                    visibility=visibility.detach()
+                    areas=areas.detach()
+                    categories=categories.detach()
 
                     #Delete data to save memory
-                    del us_frames, target_keypoints,categories,loss
+                    del us_frames, target_keypoints,target_areas,target_visibility,target_categories,loss
                 
 
 
