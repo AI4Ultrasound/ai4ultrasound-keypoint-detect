@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
+import utils
+
 
 
 class KeypointLoss(nn.Module):
@@ -172,182 +172,6 @@ class KeypointLoss(nn.Module):
                 f"Use 'L1' or 'L2'."
             )
         return loss
-    
-    def _apply_hungarian_matching(self, pred, pred_cats_logits, target, visibility, areas, categories):
-        """
-        Solve the optimal 1-to-1 assignment per image, then repack the
-        matched pairs into padded tensors so _compute_keypoint_loss can be
-        applied identically to the fixed-matching path.
-
-        Inputs
-        ------
-        pred             : (B, K_pred, 2)
-        pred_cats_logits : (B, K_pred, num_classes)  or  None
-        target           : (B, K_tgt,  2)
-        visibility       : (B, K_tgt)   bool
-        areas            : (B, K_tgt)   float  or  None
-        categories       : (B, K_tgt)   long
-
-        Returns  (padded to K_max = largest matched-pair count in the batch)
-        -------
-        matched_pred  : (B, K_max, 2)
-        matched_tgt   : (B, K_max, 2)
-        matched_vis   : (B, K_max)    bool   True=real pair, False=padding
-        matched_areas : (B, K_max)    float  or  None
-        matched_cats  : (B, K_max)    long   category of the matched target
-        """
-
-        B=pred.shape[0]
-        device=pred.device
-
-        # ---- solve per image -------------------------------------------
-        all_pred_idx, all_tgt_idx = [], []
-        #Loop through the batch
-        for b in range(B):
-            pi, tj = self._hungarian_match_single(
-                pred_kps         = pred[b],
-                pred_cats_logits = (pred_cats_logits[b]
-                                    if pred_cats_logits is not None else None),
-                target_kps  = target[b],
-                target_cats = categories[b],
-                vis_mask    = visibility[b],
-            )
-
-            #Append to list containing all the matching indices
-            all_pred_idx.append(pi)
-            all_tgt_idx.append(tj)
-
-        # ---- pad to largest matched count ------------------------------
-        counts = [idx.shape[0] for idx in all_pred_idx]
-        K_max  = max(counts) if any(c > 0 for c in counts) else 1
-
-        #Pre-allocate tensors
-        matched_pred=torch.zeros(B, K_max, 2, dtype=pred.dtype,   device=device)
-        matched_tgt=torch.zeros(B, K_max, 2, dtype=target.dtype, device=device)
-        matched_vis=torch.zeros(B, K_max,    dtype=torch.bool,   device=device)
-        matched_areas=(torch.zeros(B, K_max, dtype=areas.dtype, device=device)
-                         if areas is not None else None)
-        matched_cats=torch.full((B, K_max), -1, dtype=torch.long, device=device)
-
-        for b in range(B):
-            pred_i=all_pred_idx[b].to(device)
-            tgt_j=all_tgt_idx[b].to(device)
-            N=pred_i.shape[0]
-            if N == 0:
-                continue
-            matched_pred[b, :N]=pred[b][pred_i] #Gets the matching pred and target up to max size of pred
-            matched_tgt[b,  :N]=target[b][tgt_j]
-            matched_vis[b,  :N]=True
-            if areas is not None:
-                matched_areas[b, :N]=areas[b][tgt_j]
-            matched_cats[b, :N]=categories[b][tgt_j]
-
-        return matched_pred, matched_tgt, matched_vis, matched_areas, matched_cats
-
-    def _hungarian_match_single(
-        self, pred_kps, pred_cats_logits, target_kps, target_cats, vis_mask
-    ):
-        """
-        Solve the assignment problem for one image (finds closest matching keypoints).
-
-        pred_kps         : (K_pred, 2)
-        pred_cats_logits : (K_pred, num_classes)  or  None
-        target_kps       : (K_tgt,  2)
-        target_cats      : (K_tgt,) long   1=pleural  2=bline  -1=padded
-        vis_mask         : (K_tgt,) bool
-
-        Returns
-        -------
-        pred_idx   : (N_matched,) long — matched row indices in pred
-        target_idx : (N_matched,) long — matched row indices in target
-        """
-        real_tgt_idx = vis_mask.nonzero(as_tuple=False).squeeze(1)   # (N_real,)
-        N_real = real_tgt_idx.shape[0]
-        if N_real == 0:
-            return (torch.empty(0, dtype=torch.long),
-                    torch.empty(0, dtype=torch.long)) #Returns empty indexes if there are no visible keypoints
-
-        K_pred = pred_kps.shape[0]
-
-        # Spatial cost: squared L2  (K_pred × N_real)
-        p    = pred_kps.unsqueeze(1)                       # (K_pred, 1,      2)
-        t    = target_kps[real_tgt_idx].unsqueeze(0)       # (1,      N_real, 2)
-        cost = torch.sum((p - t) ** 2, dim=-1)             # (K_pred, N_real)
-
-        # Optional category cost: CE for every pred–target combination
-        # This gives the category head gradient signal through the cost matrix
-        # NOTE: linear_sum_assignment uses .detach() so gradients do NOT flow
-        # through the matching decision itself — only through the loss on matched pairs.
-        # Add an explicit category CE loss term in your training loop if you want
-        # stronger gradient signal to the category head.
-        if pred_cats_logits is not None:
-            cat_cost = torch.zeros(K_pred, N_real, device=pred_kps.device)
-            for j, tgt_j in enumerate(real_tgt_idx):
-                # Category labels are 1-indexed; CE expects 0-indexed
-                label          = (target_cats[tgt_j] - 1).clamp(min=0).expand(K_pred)
-                cat_cost[:, j] = F.cross_entropy(
-                    pred_cats_logits, label, reduction='none'
-                )
-            cost = cost + cat_cost                          # (K_pred, N_real)
-
-        # Solve on CPU (scipy requirement)
-        pred_i, tgt_j = linear_sum_assignment(cost.detach().cpu().numpy())
-
-        pred_i = torch.tensor(pred_i, dtype=torch.long)
-        tgt_j  = real_tgt_idx[torch.tensor(tgt_j, dtype=torch.long)]
-        return pred_i, tgt_j
-    
-    def _make_target_heatmaps(self, keypoints, visibility, categories, H_out, W_out, H_in, W_in):
-        """
-        Creates Gaussian heatmaps from target keypoint coordinates.
-        keypoints  : (B, K, 2)  pixel coords in input image space (x, y)
-        visibility : (B, K)   bool
-        categories : (B, K)   long  1=pleural  2=bline  -1=padded
-        H_out/W_out : heatmap spatial dimensions
-        H_in/W_in   : input image spatial dimensions  (for coordinate scaling)
-
-        Returns
-        -------
-        heatmaps      : (B, num_categories, H_out, W_out)  float32
-        target_weight : (B, num_categories)                 float32
-                        1.0 if channel has >= 1 visible keypoint, else 0.0
-        """
-
-        B, K, _ = keypoints.shape
-        device  = keypoints.device
-        scale_x = W_out / W_in
-        scale_y = H_out / H_in
-
-        yy = torch.arange(H_out, dtype=torch.float32, device=device)
-        xx = torch.arange(W_out, dtype=torch.float32, device=device)
-        grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')   # (H_out, W_out)
-
-        heatmaps      = torch.zeros(B, self.num_categories, H_out, W_out,
-                                    dtype=torch.float32, device=device)
-        target_weight = torch.zeros(B, self.num_categories,
-                                    dtype=torch.float32, device=device)
-
-        for b in range(B):
-            for k in range(K):
-                if not visibility[b, k]:
-                    continue
-                cat_idx = int(categories[b, k].item()) - 1    # 1→0, 2→1
-                if cat_idx < 0:
-                    continue   # padded slot
-
-                cx = keypoints[b, k, 0].item() * scale_x
-                cy = keypoints[b, k, 1].item() * scale_y
-
-                gauss = torch.exp(
-                    -((grid_x - cx) ** 2 + (grid_y - cy) ** 2)
-                    / (2.0 * self.heatmap_sigma ** 2)
-                )   # (H_out, W_out)
-
-                # max-blend: N keypoints of the same category → N distinct peaks
-                heatmaps[b, cat_idx]      = torch.max(heatmaps[b, cat_idx], gauss)
-                target_weight[b, cat_idx] = 1.0
-
-        return heatmaps, target_weight
 
     ##############Forward Methods###########
 
@@ -423,7 +247,7 @@ class KeypointLoss(nn.Module):
         if self.matching_strategy=='fixed':
             loss=self._compute_keypoint_loss(pred, target, visibility, areas, categories)
         elif self.matching_strategy=='hungarian':
-            pred_matched, target_matched, vis_matched, areas_matched, cats_matched = self._apply_hungarian_matching(pred, pred_categories, target, visibility, areas, categories)
+            pred_matched, target_matched, vis_matched, areas_matched, cats_matched = utils.apply_hungarian_matching(pred, pred_categories, target, visibility, areas, categories)
             loss=self._compute_keypoint_loss(pred_matched, target_matched, vis_matched, areas_matched, cats_matched)
         elif self.matching_strategy=='heatmap':
             if image_shape is None:
@@ -436,7 +260,7 @@ class KeypointLoss(nn.Module):
                 raise ValueError(
                     "(H_in, W_in) must be supplied for heatmap matching."
                 )
-            heatmaps, weight = self._make_target_heatmaps(target, visibility, categories, H_out, W_out, H_in, W_in)
+            heatmaps, weight = utils.make_target_heatmaps(target, visibility, categories, H_out, W_out, H_in, W_in,self.num_categories,self.heatmap_sigma)
             loss=self._compute_heatmap_loss(pred,heatmaps,weight)
             
             

@@ -58,7 +58,8 @@ class ModelTrainer(nn.Module):
             self.loadCheckpoint()
         
     #######Checkpointing Methods#######
-    def saveCheckpoint(self,epoch,valid_loss,euc_mm_err_avg,euc_mm_err_std,peraxis_mm_err_avg,peraxis_mm_err_std): #Save model to file for checkpointing
+    def saveCheckpoint(self,epoch,valid_loss,euc_mm_err_avg,euc_mm_err_std,peraxis_mm_err_avg,peraxis_mm_err_std,
+                       euc_px_err_avg,euc_px_err_std,peraxis_px_err_avg,peraxis_px_err_std): #Save model to file for checkpointing
         if self.checkpoint_savepath is None:
             return #No file name defined
         if not os.path.exists(self.checkpoint_savedir):
@@ -74,7 +75,11 @@ class ModelTrainer(nn.Module):
             'euc_mm_err_avg':euc_mm_err_avg,
             'euc_mm_err_std':euc_mm_err_std,
             'peraxis_mm_err_avg':peraxis_mm_err_avg,
-            'peraxis_mm_err_std':peraxis_mm_err_std
+            'peraxis_mm_err_std':peraxis_mm_err_std,
+            'euc_px_err_avg':euc_px_err_avg,
+            'euc_px_err_std':euc_px_err_std,
+            'peraxis_px_err_avg':peraxis_px_err_avg,
+            'peraxis_px_err_std':peraxis_px_err_std
         },self.checkpoint_savepath)
 
     def loadCheckpoint(self):
@@ -196,7 +201,7 @@ class ModelTrainer(nn.Module):
                         del us_frames, pred_keypoints,pred_categories,target_keypoints,target_areas,target_visibility,target_categories,loss
                 
 
-                ###########Log Training Error###########
+                ###########Log Training Loss and Error###########
 
 
 

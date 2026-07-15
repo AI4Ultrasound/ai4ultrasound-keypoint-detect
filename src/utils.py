@@ -5,10 +5,13 @@ import glob
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import numpy as np
 import pydicom
 from scipy.ndimage import map_coordinates
 from PIL import Image
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 
 #Class ID numbers
 CLASS_ID_PLEURAL_LINE=1
@@ -859,4 +862,348 @@ def frame_collate_fn(frame_batch):
     }
 
 
-#############################Dataclasses######################
+#############################Matching, Heatmap Decoding and Error Computation Functions######################
+
+#Hungarian Matching Algorithm Functions:
+def hungarian_match_single(pred_kps, pred_cats_logits, target_kps, target_cats, vis_mask):
+    """
+    Solve the assignment problem for one image (finds closest matching keypoints).
+
+    pred_kps         : (K_pred, 2)
+    pred_cats_logits : (K_pred, num_classes)  or  None
+    target_kps       : (K_tgt,  2)
+    target_cats      : (K_tgt,) long   1=pleural  2=bline  -1=padded
+    vis_mask         : (K_tgt,) bool
+
+    Returns
+    -------
+    pred_idx   : (N_matched,) long — matched row indices in pred
+    target_idx : (N_matched,) long — matched row indices in target
+    """
+    real_tgt_idx = vis_mask.nonzero(as_tuple=False).squeeze(1)   # (N_real,)
+    N_real = real_tgt_idx.shape[0]
+    if N_real == 0:
+        return (torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long)) #Returns empty indexes if there are no visible keypoints
+
+    K_pred = pred_kps.shape[0]
+
+    # Spatial cost: squared L2  (K_pred × N_real)
+    p    = pred_kps.unsqueeze(1)                       # (K_pred, 1,      2)
+    t    = target_kps[real_tgt_idx].unsqueeze(0)       # (1,      N_real, 2)
+    cost = torch.sum((p - t) ** 2, dim=-1)             # (K_pred, N_real)
+
+    # Optional category cost: CE for every pred–target combination
+    # This gives the category head gradient signal through the cost matrix
+    # NOTE: linear_sum_assignment uses .detach() so gradients do NOT flow
+    # through the matching decision itself — only through the loss on matched pairs.
+    # Add an explicit category CE loss term in your training loop if you want
+    # stronger gradient signal to the category head.
+    if pred_cats_logits is not None:
+        cat_cost = torch.zeros(K_pred, N_real, device=pred_kps.device)
+        for j, tgt_j in enumerate(real_tgt_idx):
+            # Category labels are 1-indexed; CE expects 0-indexed
+            label          = (target_cats[tgt_j] - 1).clamp(min=0).expand(K_pred)
+            cat_cost[:, j] = F.cross_entropy(
+                pred_cats_logits, label, reduction='none'
+            )
+        cost = cost + cat_cost                          # (K_pred, N_real)
+
+    # Solve on CPU (scipy requirement)
+    pred_i, tgt_j = linear_sum_assignment(cost.detach().cpu().numpy())
+
+    pred_i = torch.tensor(pred_i, dtype=torch.long)
+    tgt_j  = real_tgt_idx[torch.tensor(tgt_j, dtype=torch.long)]
+    return pred_i, tgt_j
+
+def apply_hungarian_matching( pred, pred_cats_logits, target, visibility, areas, categories):
+    """
+    Solve the optimal 1-to-1 assignment per image, then repack the
+    matched pairs into padded tensors so _compute_keypoint_loss can be
+    applied identically to the fixed-matching path.
+
+    Inputs
+    ------
+    pred             : (B, K_pred, 2)
+    pred_cats_logits : (B, K_pred, num_classes)  or  None
+    target           : (B, K_tgt,  2)
+    visibility       : (B, K_tgt)   bool
+    areas            : (B, K_tgt)   float  or  None
+    categories       : (B, K_tgt)   long
+
+    Returns  (padded to K_max = largest matched-pair count in the batch)
+    -------
+    matched_pred  : (B, K_max, 2)
+    matched_tgt   : (B, K_max, 2)
+    matched_vis   : (B, K_max)    bool   True=real pair, False=padding
+    matched_areas : (B, K_max)    float  or  None
+    matched_cats  : (B, K_max)    long   category of the matched target
+    """
+
+    B=pred.shape[0]
+    device=pred.device
+
+    # ---- solve per image -------------------------------------------
+    all_pred_idx, all_tgt_idx = [], []
+    #Loop through the batch
+    for b in range(B):
+        pi, tj = hungarian_match_single(
+            pred_kps         = pred[b],
+            pred_cats_logits = (pred_cats_logits[b]
+                                if pred_cats_logits is not None else None),
+            target_kps  = target[b],
+            target_cats = categories[b],
+            vis_mask    = visibility[b],
+        )
+
+        #Append to list containing all the matching indices
+        all_pred_idx.append(pi)
+        all_tgt_idx.append(tj)
+
+    # ---- pad to largest matched count ------------------------------
+    counts = [idx.shape[0] for idx in all_pred_idx]
+    K_max  = max(counts) if any(c > 0 for c in counts) else 1
+
+    #Pre-allocate tensors
+    matched_pred=torch.zeros(B, K_max, 2, dtype=pred.dtype,   device=device)
+    matched_tgt=torch.zeros(B, K_max, 2, dtype=target.dtype, device=device)
+    matched_vis=torch.zeros(B, K_max,    dtype=torch.bool,   device=device)
+    matched_areas=(torch.zeros(B, K_max, dtype=areas.dtype, device=device)
+                        if areas is not None else None)
+    matched_cats=torch.full((B, K_max), -1, dtype=torch.long, device=device)
+
+    for b in range(B):
+        pred_i=all_pred_idx[b].to(device)
+        tgt_j=all_tgt_idx[b].to(device)
+        N=pred_i.shape[0]
+        if N == 0:
+            continue
+        matched_pred[b, :N]=pred[b][pred_i] #Gets the matching pred and target up to max size of pred
+        matched_tgt[b,  :N]=target[b][tgt_j]
+        matched_vis[b,  :N]=True
+        if areas is not None:
+            matched_areas[b, :N]=areas[b][tgt_j]
+        matched_cats[b, :N]=categories[b][tgt_j]
+
+    return matched_pred, matched_tgt, matched_vis, matched_areas, matched_cats
+
+#Keypoint Heatmap Handling Functions
+def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, W_in,num_categories,heatmap_sigma):
+    """
+    Creates Gaussian heatmaps from target keypoint coordinates.
+    keypoints  : (B, K, 2)  pixel coords in input image space (x, y)
+    visibility : (B, K)   bool
+    categories : (B, K)   long  1=pleural  2=bline  -1=padded
+    H_out/W_out : heatmap spatial dimensions
+    H_in/W_in   : input image spatial dimensions  (for coordinate scaling)
+
+    Returns
+    -------
+    heatmaps      : (B, num_categories, H_out, W_out)  float32
+    target_weight : (B, num_categories)                 float32
+                    1.0 if channel has >= 1 visible keypoint, else 0.0
+    """
+
+    B, K, _ = keypoints.shape
+    device  = keypoints.device
+    scale_x = W_out / W_in
+    scale_y = H_out / H_in
+
+    yy = torch.arange(H_out, dtype=torch.float32, device=device)
+    xx = torch.arange(W_out, dtype=torch.float32, device=device)
+    grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')   # (H_out, W_out)
+
+    heatmaps      = torch.zeros(B, num_categories, H_out, W_out,
+                                dtype=torch.float32, device=device)
+    target_weight = torch.zeros(B, num_categories,
+                                dtype=torch.float32, device=device)
+
+    for b in range(B):
+        for k in range(K):
+            if not visibility[b, k]:
+                continue
+            cat_idx = int(categories[b, k].item()) - 1    # 1→0, 2→1
+            if cat_idx < 0:
+                continue   # padded slot
+
+            cx = keypoints[b, k, 0].item() * scale_x
+            cy = keypoints[b, k, 1].item() * scale_y
+
+            gauss = torch.exp(
+                -((grid_x - cx) ** 2 + (grid_y - cy) ** 2)
+                / (2.0 * heatmap_sigma ** 2)
+            )   # (H_out, W_out)
+
+            # max-blend: N keypoints of the same category → N distinct peaks
+            heatmaps[b, cat_idx]      = torch.max(heatmaps[b, cat_idx], gauss)
+            target_weight[b, cat_idx] = 1.0
+
+    return heatmaps, target_weight
+
+def decode_heatmaps(heatmaps, H_in, W_in,
+                    detection_threshold=0.3, nms_kernel=5):
+    """
+    heatmaps : (B, C, H', W')
+    Returns  : list[B] of list of
+               {'xy': (x,y), 'score': float, 'category': int}
+    """
+    B, C, H_out, W_out = heatmaps.shape
+    # Option A: simple consistent scaling (no +0.5)
+    scale_x = W_in / W_out
+    scale_y = H_in / H_out
+
+    # NMS via max-pool
+    pad = nms_kernel // 2
+    hmap_max = F.max_pool2d(
+        heatmaps,                        # (B, C, H', W')
+        kernel_size=nms_kernel,
+        stride=1,
+        padding=pad
+    )
+    peak_mask = (heatmaps == hmap_max) & (heatmaps > detection_threshold)
+
+    pred_kps_list, pred_cats_list, pred_scores_list = [], [], []
+    for b in range(B):
+        kps_b, cats_b, scores_b = [], [], []
+        for c in range(C):
+            ys, xs = peak_mask[b, c].nonzero(as_tuple=True)
+            for py, px in zip(ys.tolist(), xs.tolist()):
+                score = heatmaps[b, c, py, px].item()
+
+                # Optional: subpixel refinement
+                rx, ry = float(px), float(py)
+                hmap = heatmaps[b, c]
+                if 0 < px < W_out - 1:
+                    dx = hmap[py, px + 1] - hmap[py, px - 1]
+                    rx += 0.25 * dx.sign().item()
+                if 0 < py < H_out - 1:
+                    dy = hmap[py + 1, px] - hmap[py - 1, px]
+                    ry += 0.25 * dy.sign().item()
+                kp_coords=torch.stack([
+                    rx * scale_x, 
+                    ry * scale_y,
+                ],dim=-1)
+                kps_b.append(kp_coords)
+                cats_b.append(torch.full((ys.numel(),),c+1,dtype=torch.long))
+                scores_b.append(score)
+
+
+        if kps_b:
+            pred_kps_list.append(torch.cat(kps_b,    dim=0))
+            pred_cats_list.append(torch.cat(cats_b,  dim=0))
+            pred_scores_list.append(torch.cat(scores_b, dim=0))
+        else:
+            # Image has zero detections — return empty tensors so indexing is safe
+            pred_kps_list.append(torch.zeros(0, 2))
+            pred_cats_list.append(torch.zeros(0, dtype=torch.long))
+            pred_scores_list.append(torch.zeros(0))
+
+    return pred_kps_list,pred_cats_list,pred_scores_list
+
+#Error computation functions
+
+def calculateError(pred,pred_categories,target_keypoints,visibility,areas,categories,
+                   return_mode,matching_strategy,num_categories,image_shape,px_mul_x,px_mul_y):
+    """
+    Input:
+        - pred: output of model (either keypoints or heatmap). (B, K_pred, 2) when keypoints, (B, num_cat, H', W') when heatmap
+        - pred_categories: The predicted categories (pleural vs. B-line). (B, K_pred, num_classes)
+        - target_keypoints: (B, K, 2)    ground-truth keypoint pixel coordinates
+        - visibility: (B, K)  bool, which ground-truth keypoints are visible
+        - categories: (B, K)  long    1=pleural  2=bline  -1=padded (ground truth categories)
+        - return_mode: 'clip' or 'frame'
+        - matching_strategy: 'fixed','hungarian' or 'heatmap'. What is used by the loss function.
+        - num_categories: int. Number of categories we are predicting.
+        - image_shape: tuple of image dimension 
+    Return:
+        - localization_dict:
+            - Contains: euc_mm_err_avg,euc_mm_err_std,peraxis_mm_err_avg,peraxis_mm_err_std,euc_px_err_avg,euc_px_err_std,peraxis_px_err_avg,peraxis_px_err_std,perc_err
+        - detect_dict: Dictionary with metrics reflecting how good the dtection was (right number of keypoints)
+            - Contains Precision, Recall, F1 and count error (per frame)
+    ***Note: in the case when return_mode=='clip' it is (B,T..) dimensions above
+    """
+    ######If we are doing 'clip' mode
+    if return_mode=='clip':
+        if matching_strategy in ('fixed','hungarian'):
+            if pred.dim() != 4:
+                raise ValueError(
+                    f"clip + {matching_strategy}: expected 4-D pred "
+                    f"(B,T,K,2), got {pred.dim()}-D"
+                )
+            #convert from (B,T,K,2) to (B*T,K,2)
+            B,T,K_pred,_=pred.shape
+            pred   = pred.reshape(B * T, K_pred, 2)
+            target_keypoints = target_keypoints.reshape(B * T, target_keypoints.shape[2], 2)
+            if visibility  is not None: visibility  = visibility.view(B * T, -1)
+            if areas       is not None: areas       = areas.view(B * T, -1),
+            if categories  is not None: categories  = categories.view(B * T, -1)
+            if pred_categories is not None: pred_categories = pred_categories.reshape(B * T, K_pred, -1)
+        else: #Doing heatmap matching strategy
+            # (B, T, C, H', W') → (B*T, C, H', W')
+            if pred.dim() != 5:
+                raise ValueError(
+                    f"clip + heatmap: expected 5-D pred "
+                    f"(B,T,C,H',W'), got {pred.dim()}-D"
+                )
+            B, T, C, H_out, W_out = pred.shape
+            pred   = pred.reshape(B * T, C, H_out, W_out)
+            target_keypoints = target_keypoints.reshape(B * T, target_keypoints.shape[2], 2)
+            if visibility  is not None: visibility  = visibility.reshape(B * T, -1)
+            if areas       is not None: areas       = areas.reshape(B * T, -1)
+            if categories  is not None: categories  = categories.reshape(B * T, -1)
+            
+    elif return_mode=='frame':
+        expected = 3 if matching_strategy in ('fixed', 'hungarian') else 4
+        if pred.dim() != expected:
+            raise ValueError(
+                f"frame + {matching_strategy}: expected {expected}-D pred, "
+                f"got {pred.dim()}-D"
+            )
+    else:
+        raise ValueError(f"Error with return_mode, got pred dim: {pred.dim()}D and return_mode: {return_mode}")
+
+    H_in, W_in   = image_shape #Gets the image shape
+    if matching_strategy=='heatmap':
+        #Convert predicted heatmap to keypoint coordinates        
+        pred,pred_categories,pred_scores_list=decode_heatmaps(pred, H_in, W_in,detection_threshold=0.3, nms_kernel=5)
+
+        # Pad variable-length per-image detections into (B, K_max, 2) tensors
+        K_max = max((p.shape[0] for p in pred), default=1)
+        K_max = max(K_max, 1)
+
+        pred_kps_batch  = torch.zeros(B, K_max, 2)
+        pred_cats_batch = torch.full((B, K_max), -1, dtype=torch.long)
+        pred_vis_batch  = torch.zeros(B, K_max, dtype=torch.bool)
+
+        for b in range(B):
+            n = pred[b].shape[0]
+            if n > 0:
+                pred_kps_batch[b,  :n] = pred[b]
+                pred_cats_batch[b, :n] = pred_categories[b]
+                pred_vis_batch[b,  :n] = True
+        
+        pred=pred_kps_batch
+        pred_categories=pred_cats_batch
+
+    
+    #####Apply the hungarian matching
+    matched_pred, matched_tgt, matched_vis, _, matched_cats=apply_hungarian_matching(pred,pred_categories,target_keypoints,visibility,areas,categories)
+
+
+    #Compute the localization dict (how close are keypoints)
+    #Create a vis_mask that invisible/padded keypoints are zeroid out
+    vis_mask = (visibility > 0).unsqueeze(-1).float()
+    n_vis= vis_mask.sum().clamp(min=1.0)           # total visible keypoints
+
+    #All errors are computed as average across B_eff and K (where B_eff=B in frame, or B_eff=B*T in clip mode)
+    #matched_pred and matched_tgt have dimensions: (B_eff, K, 2)
+    #Compute euclidean distance and std in pixel
+    euc_dist_px=torch.sqrt(
+        (((matched_pred-matched_tgt)**2)*vis_mask).sum(dim=2)
+        ) #Euclidean dist across (B_eff,K)
+    euc_dist_px_avg=euc_dist_px.sum()/n_vis
+    euc_dist_px_std=euc_dist_px.flatten()[(visibility > 0).flatten()].std() #Gets the standard deviation of only visible points
+
+    #
+
+
