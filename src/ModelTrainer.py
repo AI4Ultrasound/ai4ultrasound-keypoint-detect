@@ -6,8 +6,9 @@ import os
 
 class ModelTrainer(nn.Module):
     def __init__(self,model,loss_fun,optimizer,train_loader,valid_loader,
-                 num_epocs,device,loss_type,LR_scheduler=None,return_mode='frame',
-                 checkpoint_savedir='models',model_name_save='model',model_name_load='model',start_from_checkpoint=False,):
+                 num_epocs,device,loss_type,us_framesize,LR_scheduler=None,return_mode='frame',
+                 checkpoint_savedir='models',model_name_save='model',model_name_load='model',start_from_checkpoint=False,
+                 matching_strategy='heatmap'):
         
         super(ModelTrainer,self).__init__()
         ##########Init Class Params#########
@@ -21,6 +22,10 @@ class ModelTrainer(nn.Module):
         self.loss_type=loss_type
         self.LR_scheduler=LR_scheduler
         self.return_mode=return_mode
+        self.matching_strategy=matching_strategy
+        self.H_in=us_framesize[0]
+        self.W_in=us_framesize[1]
+
 
         #Checkpointing params
         self.checkpoint_savedir=checkpoint_savedir
@@ -39,6 +44,52 @@ class ModelTrainer(nn.Module):
 
         self.start_epoch=0
         self.best_valid_loss=float(10000.0) #Keep model with best validation loss
+
+        #Logger save path (saved at end of training)
+        logger_save_dir=os.path.join('logs',model_name_save)
+        if not os.path.isdir(logger_save_dir):
+            os.makedirs(logger_save_dir,exist_ok=True)
+        
+        self.train_logger_save_path=os.path.join(logger_save_dir,'train_logger.json')
+        self.valid_logger_save_path=os.path.join(logger_save_dir,'valid_logger.json')
+        
+        #Load from checkpoint
+        if start_from_checkpoint and os.path.isfile(self.checkpoint_loadpath):
+            self.loadCheckpoint()
+        
+    #######Checkpointing Methods#######
+    def saveCheckpoint(self,epoch,valid_loss,euc_mm_err_avg,euc_mm_err_std,peraxis_mm_err_avg,peraxis_mm_err_std): #Save model to file for checkpointing
+        if self.checkpoint_savepath is None:
+            return #No file name defined
+        if not os.path.exists(self.checkpoint_savedir):
+            os.makedirs(self.checkpoint_savedir)
+        self.best_valid_loss=valid_loss
+        torch.save({
+            'epoch':epoch,
+            'model_state_dict':self.model.state_dict(),
+            'optimizer_state_dict':self.optimizer.state_dict(),
+            'best_valid_loss':self.best_valid_loss,
+            'training_logger':self.training_logger,
+            'valid_logger':self.valid_logger,
+            'euc_mm_err_avg':euc_mm_err_avg,
+            'euc_mm_err_std':euc_mm_err_std,
+            'peraxis_mm_err_avg':peraxis_mm_err_avg,
+            'peraxis_mm_err_std':peraxis_mm_err_std
+        },self.checkpoint_savepath)
+
+    def loadCheckpoint(self):
+        #Loads from checkpoint if we are doing that
+        checkpoint=torch.load(self.checkpoint_loadpath)
+        self.model.load_state_dict(checkpoint['model_state_dict'])  
+        self.model=self.model.to(self.device)
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict']) 
+        self.start_epoch=checkpoint['epoch']
+        self.best_valid_loss=checkpoint['best_valid_loss']     
+        self.training_logger=checkpoint['training_logger']   
+        self.valid_logger=checkpoint['valid_logger']
+
+        if self.verbose:
+            print(f"Loaded checkpoint from epoch {self.start_epoch}, best validation loss: {self.best_valid_loss:.4f}")
     
     def train(self):
         #######Main Trainer Function where we conduct both training and validation
@@ -63,8 +114,16 @@ class ModelTrainer(nn.Module):
                     px_mul_y=data['px_mul_y']
 
                     #Gets prediction and runs the loss
-                    pred_keypoints,pred_categories=self.model(us_frames)
-                    loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories)
+                    if self.matching_strategy in ('fixed','hungarian'):
+                        pred_keypoints,pred_categories=self.model(us_frames)
+                        loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories,pred_categories=pred_categories)
+                    elif self.matching_strategy=='heatmap':
+                        pred_heatmaps=self.model(us_frames) #shape (B,2,H',W')
+                        loss = self.loss_fun(
+                        pred_heatmaps, target_keypoints,
+                        target_visibility, target_areas, target_categories,
+                        image_shape = (self.H_in,self.W_in),  
+                    )
 
                 if self.return_mode=='clip': #Using the clip_collate_fn return where we pad the end of the time dimension with zeros
                     us_frames=data['images'].to(self.device,non_blocking=True) #(B,T, C, H, W)
@@ -76,9 +135,6 @@ class ModelTrainer(nn.Module):
                     px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul), (B,T)
                     px_mul_y=data['px_mul_y']
 
-                    #Run the prediction
-                    pred_keypoints=self.model(us_frames,padding_mask)
-
                     #Get target keypoints, visibiity and categories
                     target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,T,K_max,2)  
                     target_areas=data['areas'].to(self.device,non_blocking=True)  #(B,T,K)
@@ -87,17 +143,29 @@ class ModelTrainer(nn.Module):
 
                     target_visibility=target_visibility & padding_mask.unsqueeze(-1) #mask out any visibility for frames which have been padded
 
-                    if not visibility.any():
+                    if not target_visibility.any():
                         del us_frames,padding_mask, target_keypoints,target_visibility,target_categories,target_areas
                         continue
 
-                    #Gets the loss
-                    loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories)
+                    #Gets prediction and runs the loss
+                    if self.matching_strategy in ('fixed','hungarian'):
+                        pred_keypoints,pred_categories=self.model(us_frames)
+                        loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories,pred_categories=pred_categories)
+                    elif self.matching_strategy=='heatmap':
+                        pred_heatmaps=self.model(us_frames) #shape (B,2,H',W')
+                        loss = self.loss_fun(
+                        pred_heatmaps, target_keypoints,
+                        target_visibility, target_areas, target_categories,
+                        image_shape = (self.H_in,self.W_in),  
+                    )
                 
 
                 if torch.isnan(loss):
                     self.optimizer.zero_grad()
-                    del us_frames, target_keypoints,target_areas,target_visibility,target_categories,loss
+                    if self.matching_strategy=='heatmap':
+                        del us_frames, pred_heatmaps,target_keypoints,target_areas,target_visibility,target_categories,loss
+                    else:
+                        del us_frames, pred_keypoints,pred_categories,target_keypoints,target_areas,target_visibility,target_categories,loss
                     continue
                 else:
                     #Backpropagation
@@ -111,15 +179,24 @@ class ModelTrainer(nn.Module):
                             self.LR_scheduler.step() #Step every batch for one cycle lr
 
                     #Detach from computational graph
-                    pred_keypoints=pred_keypoints.detach()
+                    if self.matching_strategy=='heatmap':
+                        pred_heatmaps=pred_heatmaps.detach()
+                    else:
+                        pred_categories=pred_categories.detach()
+                        pred_keypoints=pred_keypoints.detach()
                     target_keypoints=target_keypoints.detach()
-                    visibility=visibility.detach()
-                    areas=areas.detach()
-                    categories=categories.detach()
+                    target_visibility=target_visibility.detach()
+                    target_categories=target_categories.detach()
+                    target_categories=target_categories.detach()
 
                     #Delete data to save memory
-                    del us_frames, target_keypoints,target_areas,target_visibility,target_categories,loss
+                    if self.matching_strategy=='heatmap':
+                        del us_frames, pred_heatmaps,target_keypoints,target_areas,target_visibility,target_categories,loss
+                    else:
+                        del us_frames, pred_keypoints,pred_categories,target_keypoints,target_areas,target_visibility,target_categories,loss
                 
+
+                ###########Log Training Error###########
 
 
 
