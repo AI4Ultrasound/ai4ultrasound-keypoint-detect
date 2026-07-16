@@ -882,11 +882,12 @@ def hungarian_match_single(pred_kps, pred_cats_logits, target_kps, target_cats, 
     """
     real_tgt_idx = vis_mask.nonzero(as_tuple=False).squeeze(1)   # (N_real,)
     N_real = real_tgt_idx.shape[0]
-    if N_real == 0:
-        return (torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long)) #Returns empty indexes if there are no visible keypoints
-
     K_pred = pred_kps.shape[0]
+    if N_real == 0 or K_pred==0:
+        return (torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long)) #Returns empty indexes if there are no visible or predicted keypoints
+
+    
 
     # Spatial cost: squared L2  (K_pred × N_real)
     p    = pred_kps.unsqueeze(1)                       # (K_pred, 1,      2)
@@ -1043,9 +1044,12 @@ def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, 
 def decode_heatmaps(heatmaps, H_in, W_in,
                     detection_threshold=0.3, nms_kernel=5):
     """
+    Converts spatial heatmaps to keypoint detections via NMS + subpixel refinement.
     heatmaps : (B, C, H', W')
-    Returns  : list[B] of list of
-               {'xy': (x,y), 'score': float, 'category': int}
+    Returns three lists of length B:
+        - pred_kps_list    — each (N_b, 2) float  (x, y) in input-image pixels
+        - pred_cats_list   — each (N_b,)   long   1-indexed category
+        - pred_scores_list — each (N_b,)   float  peak heatmap score
     """
     B, C, H_out, W_out = heatmaps.shape
     # Option A: simple consistent scaling (no +0.5)
@@ -1070,28 +1074,28 @@ def decode_heatmaps(heatmaps, H_in, W_in,
             for py, px in zip(ys.tolist(), xs.tolist()):
                 score = heatmaps[b, c, py, px].item()
 
-                # Optional: subpixel refinement
+                # Subpixel refinement
                 rx, ry = float(px), float(py)
                 hmap = heatmaps[b, c]
-                if 0 < px < W_out - 1:
+                if 0 < px < W_out - 1: 
                     dx = hmap[py, px + 1] - hmap[py, px - 1]
                     rx += 0.25 * dx.sign().item()
                 if 0 < py < H_out - 1:
                     dy = hmap[py + 1, px] - hmap[py - 1, px]
                     ry += 0.25 * dy.sign().item()
-                kp_coords=torch.stack([
-                    rx * scale_x, 
-                    ry * scale_y,
-                ],dim=-1)
-                kps_b.append(kp_coords)
-                cats_b.append(torch.full((ys.numel(),),c+1,dtype=torch.long))
+                kps_b.append(
+                    torch.tensor([[rx * scale_x, ry * scale_y]], dtype=torch.float32)
+                )
+                cats_b.append(torch.tensor([c + 1], dtype=torch.long))
                 scores_b.append(score)
 
 
         if kps_b:
             pred_kps_list.append(torch.cat(kps_b,    dim=0))
             pred_cats_list.append(torch.cat(cats_b,  dim=0))
-            pred_scores_list.append(torch.cat(scores_b, dim=0))
+            pred_scores_list.append(
+                torch.tensor(scores_b, dtype=torch.float32)   # (N,)
+            )
         else:
             # Image has zero detections — return empty tensors so indexing is safe
             pred_kps_list.append(torch.zeros(0, 2))
@@ -1100,10 +1104,34 @@ def decode_heatmaps(heatmaps, H_in, W_in,
 
     return pred_kps_list,pred_cats_list,pred_scores_list
 
+def detect_one_image(pr_kps,gt_kps,threshold):
+    """
+    Runs Hungarian matching on a single predicted (pr_kps) and ground truth (gt_kps) pair and classifies 
+    whether we are keeping the match or not based on a pixel distance threshold
+    Returns:
+        - n_tp: true positives (predictions matched to a ground truth keypoint within the threshold)
+        - n_fp: false positives (predictions not matched or matched too far from a ground truth keypoint within the threshold)
+        - n_fn: false negatives (ground truth keypoints unmatched or matched too far)
+    """
+    N_pred=pr_kps.shape[0] #Number of predictions
+    N_gt=gt_kps.shape[0] #Number of ground truth predictions
+
+    if N_pred==0 and N_gt==0: #No predictions or ground truth in this frame
+        return 0,0,0
+    if N_gt==0:
+        return 0,N_pred,0 #second return is the number of false positives, which is just number of predicted
+    if N_pred==0:
+        return 0,0,N_gt #False negatives is just number of ground truth
+    
+    diff=pr_kps.unsqueeze(1)-gt_kps.unsqueeze(0) #(N_pred,N_gt,2) difference between predicted and ground truth keypoints
+    dist_mat=torch.sqrt((diff**2).sum(dim=-1)) #Euclidean distance matrix (N_pred,N_gt)
+    pred_i,tgt_j=linear_sum_assignment(dist_mat.cpu().numpy()) #Gets closest distances indexes in the dist_mat
+    n_tp=int((dist_mat[pred_i,tgt_j]<threshold).sum().item()) #Gets the number of true positives (predictions which are mathched to ground truth within the given threshold)
+    return n_tp,N_pred-n_tp,N_gt-n_tp   #n_fp=N_pred-n_tp and n_fn=N_gt-n_tp
 #Error computation functions
 
 def calculateError(pred,pred_categories,target_keypoints,visibility,areas,categories,
-                   return_mode,matching_strategy,num_categories,image_shape,px_mul_x,px_mul_y):
+                   return_mode,matching_strategy,num_categories,image_shape,px_mul_x,px_mul_y,match_threshold):
     """
     Input:
         - pred: output of model (either keypoints or heatmap). (B, K_pred, 2) when keypoints, (B, num_cat, H', W') when heatmap
@@ -1115,9 +1143,10 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
         - matching_strategy: 'fixed','hungarian' or 'heatmap'. What is used by the loss function.
         - num_categories: int. Number of categories we are predicting.
         - image_shape: tuple of image dimension 
+        - match_threshold: maximum distance between keypoints to count as a true positive
     Return:
         - localization_dict:
-            - Contains: euc_mm_err_avg,euc_mm_err_std,peraxis_mm_err_avg,peraxis_mm_err_std,euc_px_err_avg,euc_px_err_std,peraxis_px_err_avg,peraxis_px_err_std,perc_err
+            - Contains: euc_dist_mm_avg,euc_dist_mm_std,peraxis_mm_err_avg,peraxis_mm_err_std,euc_dist_px_avg,euc_dist_px_std,peraxis_px_err_avg,peraxis_px_err_std,perc_err
         - detect_dict: Dictionary with metrics reflecting how good the dtection was (right number of keypoints)
             - Contains Precision, Recall, F1 and count error (per frame)
     ***Note: in the case when return_mode=='clip' it is (B,T..) dimensions above
@@ -1159,19 +1188,25 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
                 f"frame + {matching_strategy}: expected {expected}-D pred, "
                 f"got {pred.dim()}-D"
             )
+        B_eff = pred.shape[0] #Effective number of batches
     else:
         raise ValueError(f"Error with return_mode, got pred dim: {pred.dim()}D and return_mode: {return_mode}")
 
     H_in, W_in   = image_shape #Gets the image shape
+    device     = pred.device #Gets the device
+    #Single scaling tensor that is used to convert pixels to mm
+    scale = torch.tensor([px_mul_x, px_mul_y],device=matched_pred.device,dtype=matched_pred.dtype) 
+    
+    #Must get keypoints from the heatmap if model returns a heatmap
     if matching_strategy=='heatmap':
         #Convert predicted heatmap to keypoint coordinates        
-        pred,pred_categories,pred_scores_list=decode_heatmaps(pred, H_in, W_in,detection_threshold=0.3, nms_kernel=5)
+        pred,pred_categories,_=decode_heatmaps(pred, H_in, W_in,detection_threshold=0.3, nms_kernel=5)
 
         # Pad variable-length per-image detections into (B, K_max, 2) tensors
-        K_max = max((p.shape[0] for p in pred), default=1)
+        K_max = max((p.shape[0] for p in pred), default=0)
         K_max = max(K_max, 1)
 
-        pred_kps_batch  = torch.zeros(B, K_max, 2)
+        pred_kps_batch  = torch.zeros(B, K_max, 2,dtype=torch.float32)
         pred_cats_batch = torch.full((B, K_max), -1, dtype=torch.long)
         pred_vis_batch  = torch.zeros(B, K_max, dtype=torch.bool)
 
@@ -1182,18 +1217,47 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
                 pred_cats_batch[b, :n] = pred_categories[b]
                 pred_vis_batch[b,  :n] = True
         
-        pred=pred_kps_batch
-        pred_categories=pred_cats_batch
+        pred=pred_kps_batch.to(device)
+        pred_cats_labels=pred_cats_batch.to(device) #(B_eff,K_max)
+        pred_vis=pred_vis_batch.to(device) #(B_eff,K_max)
+    else: #fixed or hungarian (model predicts keypoints)
+        if pred_categories is not None:
+            pred_cats_labels=(pred_categories.argmax(dim=-1) + 1
+                                if pred_categories.dim() == 3
+                                else pred_categories)
+        else:
+            pred_cats_labels=None
+        
+        #All prediction slots are considered visible
+        pred_vis=torch.ones(pred.shape[:2], dtype=torch.bool, device=device)
 
     
-    #####Apply the hungarian matching
-    matched_pred, matched_tgt, matched_vis, _, matched_cats=apply_hungarian_matching(pred,pred_categories,target_keypoints,visibility,areas,categories)
+    #########Apply the hungarian matching############# or not if we are using 'fixed'
+    if matching_strategy=='fixed':
+        # Model is Index-aligned by design (K_pred == K_tgt); no matching needed
+        matched_pred  = pred
+        matched_tgt   = target_keypoints
+        matched_vis   = (visibility > 0)
+        matched_areas = areas
+        matched_cats  = categories
+    else:
+        # Hungarian matching for both 'hungarian' and decoded 'heatmap' coords
+        logits_for_match = (
+            pred_categories
+            if matching_strategy == 'hungarian'
+               and pred_categories is not None
+               and pred_categories.dim() == 3
+            else None
+        )
+
+        matched_pred, matched_tgt, matched_vis, matched_areas, matched_cats=apply_hungarian_matching(pred,logits_for_match,target_keypoints,visibility,areas,categories)
 
 
-    #Compute the localization dict (how close are keypoints)
+    #########Compute the localization accuracy (how close are keypoints to ground truth)##########
     #Create a vis_mask that invisible/padded keypoints are zeroid out
-    vis_mask = (visibility > 0).unsqueeze(-1).float()
-    n_vis= vis_mask.sum().clamp(min=1.0)           # total visible keypoints
+    vis_mask = matched_vis.unsqueeze(-1).float()        # (B_eff, K, 1)
+    vis_flat = matched_vis.flatten()                     # (B_eff*K,)  bool
+    n_vis    = matched_vis.sum().float().clamp(min=1.0) # scalar
 
     #All errors are computed as average across B_eff and K (where B_eff=B in frame, or B_eff=B*T in clip mode)
     #matched_pred and matched_tgt have dimensions: (B_eff, K, 2)
@@ -1202,8 +1266,45 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
         (((matched_pred-matched_tgt)**2)*vis_mask).sum(dim=2)
         ) #Euclidean dist across (B_eff,K)
     euc_dist_px_avg=euc_dist_px.sum()/n_vis
-    euc_dist_px_std=euc_dist_px.flatten()[(visibility > 0).flatten()].std() #Gets the standard deviation of only visible points
+    euc_dist_px_std=euc_dist_px.flatten()[vis_flat].std() #Gets the standard deviation of only visible points
 
-    #
+    #Compute per-axis pixel error
+    peraxis_px_err=torch.abs(matched_pred-matched_tgt)*vis_mask #(B_eff,K,2)
+    peraxis_px_err_avg = peraxis_px_err.sum(dim=(0, 1)) / n_vis
+    peraxis_flat=peraxis_px_err.reshape(-1, 2)     # (B_eff*K, 2)
+    visible_errors   = peraxis_flat[vis_flat] #(n_vis,2)
+    peraxis_px_err_std=visible_errors.std(dim=0) #Per-axis std (2,)
+
+    #Errors in mm
+    matched_pred_mm=matched_pred*scale
+    matched_tgt_mm=matched_tgt*scale
+
+    #Euc distance in mm
+    euc_dist_mm=torch.sqrt(
+        (((matched_pred_mm-matched_tgt_mm)**2)*vis_mask).sum(dim=2)
+        ) #Euclidean dist across (B_eff,K)
+    euc_dist_mm_avg=euc_dist_mm.sum()/n_vis
+    euc_dist_mm_std=euc_dist_mm.flatten()[vis_flat].std()
+
+    #Compute per-axis mm error
+    peraxis_mm_err_avg=peraxis_px_err_avg*scale
+    peraxis_mm_err_std=peraxis_px_err_std*scale
+    #Compute the percentage error (euclidean pixel error divided by maximum diagonal)
+
+    perc_err=(float(euc_dist_px_avg)/float(np.sqrt(H_in**2+W_in**2)))*100.0
+
+    #Assign localization dict:
+    localization_dict={
+        'euc_dist_mm_avg':euc_dist_mm_avg,
+        'euc_dist_mm_std':euc_dist_mm_std,
+        'peraxis_mm_err_avg':peraxis_mm_err_avg,
+        'peraxis_mm_err_std':peraxis_mm_err_std,
+        'euc_dist_px_avg':euc_dist_px_avg,
+        'euc_dist_px_std':euc_dist_px_std,
+        'peraxis_px_err_avg':peraxis_px_err_avg,
+        'peraxis_px_err_std':peraxis_px_err_std,
+        'perc_err':perc_err,
+    }
 
 
+    ##################Compute the detection accuracy (did we estimate the right number of keypoints)######################

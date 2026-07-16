@@ -201,10 +201,76 @@ class ModelTrainer(nn.Module):
                         del us_frames, pred_keypoints,pred_categories,target_keypoints,target_areas,target_visibility,target_categories,loss
                 
 
-                ###########Log Training Loss and Error###########
+                ###########Compute Training Error and Log Loss+Error###########
 
 
+            ##################Validation################
+            self.model.eval() #Set model to evaluation mode for this epoch
+            with torch.no_grad():
+                #Loop through the validation loader
+                for data in tqdm(self.valid_loader, desc="Validation", leave=False,mininterval=1.0):
+                    
+                    if self.return_mode=='frame': #Using frame mode
+                        #Load the data
+                        us_frames=data['images'].to(self.device,non_blocking=True) #(B, C, H, W)
+                        target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,K,2) where K=number of keypoints
+                        target_areas=data['areas'].to(self.device,non_blocking=True) #(B,K)
+                        target_visibility=data['visibility'].to(self.device,non_blocking=True)
+                        target_categories=data['categories'].to(self.device,non_blocking=True)  #(B,K)
+                        px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul), size (B)
+                        px_mul_y=data['px_mul_y']
 
+                        #Gets prediction and runs the loss
+                        if self.matching_strategy in ('fixed','hungarian'):
+                            pred_keypoints,pred_categories=self.model(us_frames)
+                            loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories,pred_categories=pred_categories)
+                        elif self.matching_strategy=='heatmap':
+                            pred_heatmaps=self.model(us_frames) #shape (B,2,H',W')
+                            loss = self.loss_fun(
+                            pred_heatmaps, target_keypoints,
+                            target_visibility, target_areas, target_categories,
+                            image_shape = (self.H_in,self.W_in),  
+                        )
+
+                    if self.return_mode=='clip': #Using the clip_collate_fn return where we pad the end of the time dimension with zeros
+                        us_frames=data['images'].to(self.device,non_blocking=True) #(B,T, C, H, W)
+                        padding_mask=data['padding_mask'].to(self.device,non_blocking=True) #(B,T)
+                        #Skip this batch if less than two batches are valid
+                        if padding_mask.sum()<2:
+                            del us_frames,padding_mask
+                            continue
+                        px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul), (B,T)
+                        px_mul_y=data['px_mul_y']
+
+                        #Get target keypoints, visibiity and categories
+                        target_keypoints=data['keypoints'].to(self.device,non_blocking=True) #(B,T,K_max,2)  
+                        target_areas=data['areas'].to(self.device,non_blocking=True)  #(B,T,K)
+                        target_visibility=data['visbility'].to(self.device,non_blocking=True) #(B,T,K_max)
+                        target_categories=data['categories'].to(self.device,non_blocking=True) #(B,T,K_max)
+
+                        target_visibility=target_visibility & padding_mask.unsqueeze(-1) #mask out any visibility for frames which have been padded
+
+                        if not target_visibility.any():
+                            del us_frames,padding_mask, target_keypoints,target_visibility,target_categories,target_areas
+                            continue
+
+                        #Gets prediction and runs the loss
+                        if self.matching_strategy in ('fixed','hungarian'):
+                            pred_keypoints,pred_categories=self.model(us_frames)
+                            loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories,pred_categories=pred_categories)
+                        elif self.matching_strategy=='heatmap':
+                            pred_heatmaps=self.model(us_frames) #shape (B,2,H',W')
+                            loss = self.loss_fun(
+                            pred_heatmaps, target_keypoints,
+                            target_visibility, target_areas, target_categories,
+                            image_shape = (self.H_in,self.W_in),  
+                        )
+                    
+                    #Check that loss is not nan
+                    if torch.isnan(loss):
+                        continue
+
+                    ###########Compute Validation Error and Log Loss+Error###########
 
 
 
