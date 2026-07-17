@@ -16,6 +16,7 @@ from scipy.optimize import linear_sum_assignment
 #Class ID numbers
 CLASS_ID_PLEURAL_LINE=1
 CLASS_ID_B_LINE=2
+CATEGORY_NAMES = {CLASS_ID_PLEURAL_LINE: 'pleural', CLASS_ID_B_LINE: 'bline'}
 
 #These are data keys that are needed for processing
 REQUIRED_SCAN_KEYS = (
@@ -1131,7 +1132,7 @@ def detect_one_image(pr_kps,gt_kps,threshold):
 #Error computation functions
 
 def calculateError(pred,pred_categories,target_keypoints,visibility,areas,categories,
-                   return_mode,matching_strategy,num_categories,image_shape,px_mul_x,px_mul_y,match_threshold):
+                   return_mode,matching_strategy,num_categories,image_shape,px_mul_x,px_mul_y,match_threshold,max_diagnoal):
     """
     Input:
         - pred: output of model (either keypoints or heatmap). (B, K_pred, 2) when keypoints, (B, num_cat, H', W') when heatmap
@@ -1164,7 +1165,7 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
             pred   = pred.reshape(B * T, K_pred, 2)
             target_keypoints = target_keypoints.reshape(B * T, target_keypoints.shape[2], 2)
             if visibility  is not None: visibility  = visibility.view(B * T, -1)
-            if areas       is not None: areas       = areas.view(B * T, -1),
+            if areas       is not None: areas       = areas.view(B * T, -1)
             if categories  is not None: categories  = categories.view(B * T, -1)
             if pred_categories is not None: pred_categories = pred_categories.reshape(B * T, K_pred, -1)
         else: #Doing heatmap matching strategy
@@ -1180,7 +1181,8 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
             if visibility  is not None: visibility  = visibility.reshape(B * T, -1)
             if areas       is not None: areas       = areas.reshape(B * T, -1)
             if categories  is not None: categories  = categories.reshape(B * T, -1)
-            
+        B_eff = B * T
+
     elif return_mode=='frame':
         expected = 3 if matching_strategy in ('fixed', 'hungarian') else 4
         if pred.dim() != expected:
@@ -1194,32 +1196,48 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
 
     H_in, W_in   = image_shape #Gets the image shape
     device     = pred.device #Gets the device
+
     #Single scaling tensor that is used to convert pixels to mm
-    scale = torch.tensor([px_mul_x, px_mul_y],device=matched_pred.device,dtype=matched_pred.dtype) 
+     # ── Step 2: Build per-image scale tensor ──────────────────────────────
+    #
+    # Result: (B_eff, 1, 2) tensor so it broadcasts over (B_eff, K, 2).
+    # Each image keeps its own pixel→mm conversion — no averaging.
+    if len(px_mul_x) > 0 and isinstance(px_mul_x[0], (list, tuple)):
+        # clip mode: flatten (B, T) → (B*T,)
+        sx_flat = [float(v) for sublist in px_mul_x for v in sublist]
+        sy_flat = [float(v) for sublist in px_mul_y for v in sublist]
+    else:
+        # frame mode: already length B
+        sx_flat = [float(v) for v in px_mul_x]
+        sy_flat = [float(v) for v in px_mul_y]
+
+    # (B_eff, 2) → unsqueeze → (B_eff, 1, 2)
+    scale = torch.tensor(
+        list(zip(sx_flat, sy_flat)),
+        dtype=torch.float32,
+        device=device,
+    ).unsqueeze(1)  # (B_eff, 1, 2)
     
     #Must get keypoints from the heatmap if model returns a heatmap
     if matching_strategy=='heatmap':
         #Convert predicted heatmap to keypoint coordinates        
-        pred,pred_categories,_=decode_heatmaps(pred, H_in, W_in,detection_threshold=0.3, nms_kernel=5)
+        pred_list,pred_categories_list,_=decode_heatmaps(pred, H_in, W_in,detection_threshold=0.3, nms_kernel=5)
 
         # Pad variable-length per-image detections into (B, K_max, 2) tensors
-        K_max = max((p.shape[0] for p in pred), default=0)
+        K_max = max((p.shape[0] for p in pred_list), default=0)
         K_max = max(K_max, 1)
 
-        pred_kps_batch  = torch.zeros(B, K_max, 2,dtype=torch.float32)
-        pred_cats_batch = torch.full((B, K_max), -1, dtype=torch.long)
-        pred_vis_batch  = torch.zeros(B, K_max, dtype=torch.bool)
+        pred_kps_batch  = torch.zeros(B_eff, K_max, 2,dtype=torch.float32,device=device)
+        pred_cats_batch = torch.full((B_eff, K_max), -1, dtype=torch.long,device=device)
+        pred_vis_batch  = torch.zeros(B_eff, K_max, dtype=torch.bool,device=device)
 
-        for b in range(B):
-            n = pred[b].shape[0]
+        for b in range(B_eff):
+            n = pred_list[b].shape[0]
             if n > 0:
-                pred_kps_batch[b,  :n] = pred[b]
-                pred_cats_batch[b, :n] = pred_categories[b]
+                pred_kps_batch[b,  :n] = pred_list[b]
+                pred_cats_batch[b, :n] = pred_categories_list[b]
                 pred_vis_batch[b,  :n] = True
         
-        pred=pred_kps_batch.to(device)
-        pred_cats_labels=pred_cats_batch.to(device) #(B_eff,K_max)
-        pred_vis=pred_vis_batch.to(device) #(B_eff,K_max)
     else: #fixed or hungarian (model predicts keypoints)
         if pred_categories is not None:
             pred_cats_labels=(pred_categories.argmax(dim=-1) + 1
@@ -1291,7 +1309,7 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
     peraxis_mm_err_std=peraxis_px_err_std*scale
     #Compute the percentage error (euclidean pixel error divided by maximum diagonal)
 
-    perc_err=(float(euc_dist_px_avg)/float(np.sqrt(H_in**2+W_in**2)))*100.0
+    perc_err=(float(euc_dist_px_avg)/max_diagnoal)*100.0
 
     #Assign localization dict:
     localization_dict={
@@ -1308,3 +1326,104 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
 
 
     ##################Compute the detection accuracy (did we estimate the right number of keypoints)######################
+    """
+    We complete a per-category hungarian matching
+    The following numbers are computed for each (image,category/class):
+    - TP = pred keypoints matched to ground truth keypoints and the distance is < matched_threshold
+    - FP = pred keypoints are unmatched or too far awar from the ground truth keypoint
+    - FN = ground truth is unmatched or matches are above threshold
+
+    count_error_overall tracks |N_pred_total-N_gt_total| per image
+    """
+
+    has_cat_info=pred_cats_labels is not None #See if we have category (class) information
+
+    #Overall count error (total preds vs total ground thruth per image, not accounting for categories)
+    overall_count_errors = []
+    for b in range(B_eff):
+        N_pred_b = int(pred_vis[b].sum().item())
+        N_gt_b   = int((visibility[b] > 0).sum().item())
+        overall_count_errors.append(abs(N_pred_b - N_gt_b))
+
+    #Per-category metrics
+    cat_results={}
+    all_tp,all_fp,all_fn=0,0,0 #tp,fp,fn for this batch
+
+    for cat in range(1,num_categories+1): #Loops for each category starting at 1
+        tp_c,fp_c,fn_c=0,0,0 #results for this category
+        count_errors_c=[] #
+
+        for b in range (B_eff): #Loops for each batch for this category
+            #Ground truth keypoints of this category
+            gt_mask = (visibility[b] > 0) & (categories[b] == cat) #Mask of visible GT points for this category
+            gt_kps  = target_keypoints[b][gt_mask]   # (N_gt, 2)
+            N_gt    = gt_kps.shape[0] #Number of ground truth keypoints
+
+            #Predicted keypoints of this category
+            if has_cat_info:
+                pr_mask=pred_vis[b] & (pred_cats_labels[b]==cat) #Get the visible mask for predicted keypoints for this category
+            else:
+                #No category predictions, 
+                pr_mask=pred_vis[b]
+            pr_kps=pred[b][pr_mask] #(N_pred,2)
+            N_pred=pr_kps.shape[0]
+
+            count_errors_c.append(abs(N_pred-N_gt)) #Difference between predicted and ground truth for this category
+            n_tp,n_fp,n_fn=detect_one_image(pr_kps,gt_kps,match_threshold) #Compute the number of tp, fp, and fn for this category predictions
+            
+            #Updates accumulators for the B_eff loop
+            tp_c+=n_tp
+            fp_c+=n_fp
+            fn_c+=n_fn
+        #Updates accumulators for overall stats across categories
+        all_tp += tp_c
+        all_fp += fp_c
+        all_fn += fn_c
+
+        #Compute the precision, recall and f1 values per category
+        precision=tp_c/(tp_c+fp_c) if (tp_c+fp_c) > 0 else float('nan')
+        recall=tp_c/(tp_c+fn_c) if (tp_c+fn_c) > 0 else float('nan') 
+        f1=(2*precision*recall)/(precision+recall) if not any(np.isnan([precision,recall])) and (precision+recall) > 0 else float('nan') 
+
+        #Get the category name and store the per-category results
+        cat_name = CATEGORY_NAMES.get(cat, f'cat_{cat}')
+        cat_results[cat_name] = {
+            'precision':        precision,
+            'recall':           recall,
+            'f1':               f1,
+            'count_error_mean': float(np.mean(count_errors_c)),
+            'count_error_std':  float(np.std(count_errors_c)),
+            # Fraction of frames where the model predicted exactly the right
+            # number of keypoints for this category
+            'count_exact_acc':  float(np.mean([e == 0 for e in count_errors_c])),
+            'tp': tp_c,
+            'fp': fp_c,
+            'fn': fn_c,
+        }
+    
+    #Compute the overall recall,precision and f1 and then save in the detect_dict
+    overall_prec = all_tp / (all_tp + all_fp) if (all_tp + all_fp) > 0 else float('nan')
+    overall_rec  = all_tp / (all_tp + all_fn) if (all_tp + all_fn) > 0 else float('nan')
+    overall_f1   = (2 * overall_prec * overall_rec / (overall_prec + overall_rec)
+                    if not any(np.isnan([overall_prec, overall_rec]))
+                       and (overall_prec + overall_rec) > 0
+                    else float('nan'))
+
+    detect_dict = {
+        'per_category': cat_results,
+        'overall': {
+            'precision':        overall_prec,
+            'recall':           overall_rec,
+            'f1':               overall_f1,
+            # Overall count error = |total preds − total GT| per frame
+            # NOT the sum of per-category errors
+            'count_error_mean': float(np.mean(overall_count_errors)),
+            'count_error_std':  float(np.std(overall_count_errors)),
+            'count_exact_acc':  float(np.mean([e == 0 for e in overall_count_errors])),
+            'tp': all_tp,
+            'fp': all_fp,
+            'fn': all_fn,
+        }
+    }
+
+    return localization_dict,detect_dict
