@@ -3,6 +3,9 @@ import re
 import os
 import glob
 from typing import Any, Dict, List, Optional, Tuple
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from matplotlib.lines import Line2D
 
 import torch
 import torch.nn as nn
@@ -1427,3 +1430,809 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
     }
 
     return localization_dict,detect_dict
+
+
+##########################Helpers to Aggregate and Average Error Measures##############
+def _localization_dict_to_serializable(d):
+    """Convert any tensors in a localization_dict to plain Python types."""
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.detach().cpu().tolist()   # scalar → float, (2,) → [x, y]
+        else:
+            out[k] = v
+    return out
+
+def average_localization_dict_overbatches(self,localization_dict_list):
+    """
+    localization_dict_list is a list of localization_dict's from calculateError, we want to get average of each value across all the batches that we accumulate this list of dicts
+    """
+    if not localization_dict_list:
+        return {}
+    #init the localization dict batch avg
+    result = {}
+    keys = localization_dict_list[0].keys()
+
+    for key in keys:
+        values = [d[key] for d in localization_dict_list]
+
+        if isinstance(values[0], torch.Tensor):
+            # peraxis_* fields are (2,) tensors — stack to (N_batches, 2) then nanmean
+            stacked    = torch.stack([v.float() for v in values])  # (N_batches, ...)
+            nan_mask   = torch.isnan(stacked)
+            zeroed     = stacked.clone()
+            zeroed[nan_mask] = 0.0
+            valid_count = (~nan_mask).float().sum(dim=0).clamp(min=1.0)
+            avg = zeroed.sum(dim=0) / valid_count
+            # Restore NaN where every batch was NaN
+            avg[nan_mask.all(dim=0)] = float('nan')
+            result[key] = avg
+
+        else:
+            # FIX 2: nanmean excludes NaN stds rather than propagating them
+            arr = np.array([float(v) for v in values], dtype=np.float64)
+            result[key] = float(np.nanmean(arr))
+
+    return result
+
+def average_localization_dict_serialized(localization_dict_list):
+    """
+    Average a list of already-serialized localization dicts (loaded from JSON).
+    Values are Python floats or [x, y] lists — no tensors.
+    Used by plotting functions only.
+    """
+    if not localization_dict_list:
+        return {}
+    result = {}
+    for key in localization_dict_list[0]:
+        vals = [d[key] for d in localization_dict_list if key in d and d[key] is not None]
+        if not vals:
+            continue
+        if isinstance(vals[0], (list, tuple)):
+            result[key] = list(np.nanmean(np.array(vals, dtype=np.float64), axis=0))
+        else:
+            result[key] = float(np.nanmean(np.array([float(v) for v in vals], dtype=np.float64)))
+    return result
+
+def average_detection_dict_overbatches(self,detect_dict_list):
+    """
+    Aggregates detection metrics across batches.
+
+    Precision / Recall / F1
+        Micro-averaged: TP, FP, FN are SUMMED across batches then the
+        metrics are RECOMPUTED from the totals. This is the statistically
+        correct approach and is consistent with COCO / MMPose evaluation.
+
+    tp / fp / fn
+        Summed (they are raw integer counts).
+
+    count_error_mean / count_error_std / count_exact_acc
+        nanmean across batches — these are already per-frame statistics
+        so averaging batch estimates is appropriate.
+
+    detect_dict_list : list of detect_dicts returned by calculateError
+    """
+    if not detect_dict_list:
+        return {}
+
+    # Discover which categories exist from the first dict
+    cat_names = list(detect_dict_list[0]['per_category'].keys())
+        # ── Per-category aggregation ───────────────────────────────────────────
+    per_category_avg = {}
+    for cat_name in cat_names:
+        bucket_dicts = [d['per_category'][cat_name] for d in detect_dict_list] #Get list of dicts for per-category results for this category
+        per_category_avg[cat_name] = _aggregate_bucket(bucket_dicts)
+
+    # ── Overall aggregation ────────────────────────────────────────────────
+    overall_avg = _aggregate_bucket([d['overall'] for d in detect_dict_list])
+
+    return {
+        'per_category': per_category_avg,
+        'overall':      overall_avg,
+    }
+
+
+#Helpers for computing gaverages of the detection dict:
+def _recompute_prf(self,tp, fp, fn):
+    """Recompute precision / recall / F1 from accumulated counts."""
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else float('nan')
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if not any(np.isnan([precision, recall]))
+            and (precision + recall) > 0
+        else float('nan')
+    )
+    return precision, recall, f1
+
+
+def _aggregate_bucket(self,bucket_dicts):
+    """
+    Aggregate a list of same-bucket metric dicts from successive batches.
+
+    bucket_dicts : list[dict], each dict has keys:
+        precision, recall, f1,
+        count_error_mean, count_error_std, count_exact_acc,
+        tp, fp, fn
+    """
+    # ── Micro-average for detection metrics ────────────────────────────
+    total_tp = sum(d['tp'] for d in bucket_dicts)
+    total_fp = sum(d['fp'] for d in bucket_dicts)
+    total_fn = sum(d['fn'] for d in bucket_dicts)
+    precision, recall, f1 = _recompute_prf(total_tp, total_fp, total_fn) #We can't just take the average
+
+    # ── Nanmean for per-frame count statistics ─────────────────────────
+    # count_error_std is the within-batch std of per-frame count errors.
+    # Nanmean gives the mean within-batch variability across the epoch.
+    count_error_means = np.array(
+        [d['count_error_mean'] for d in bucket_dicts], dtype=np.float64
+    )
+    count_error_stds = np.array(
+        [d['count_error_std'] for d in bucket_dicts], dtype=np.float64
+    )
+    count_exact_accs = np.array(
+        [d['count_exact_acc'] for d in bucket_dicts], dtype=np.float64
+    )
+
+    return {
+        'precision':        precision,
+        'recall':           recall,
+        'f1':               f1,
+        'count_error_mean': float(np.nanmean(count_error_means)),
+        'count_error_std':  float(np.nanmean(count_error_stds)),
+        'count_exact_acc':  float(np.nanmean(count_exact_accs)),
+        'tp': total_tp,
+        'fp': total_fp,
+        'fn': total_fn,
+    }
+
+
+
+#######################Plotting and Statistic Computation Functions####################
+#Summary of plotting and statistic computation functions:
+"""
+computeStats: Prints & saves mean±std for every metric; reports best epoch for train/valid
+plotTrainingLoss: Left: raw per-batch loss trace with epoch markers; Right: per-epoch mean±std with best-epoch line
+plotLocalizationMetrics: 2x5 grid — each column one metric (Euc mm, Euc px, X err, Y err, % err), top=train, bottom=valid, with ±1 std shading
+plotDetectionMetrics: 2x5 grid — each column one metric (P, R, F1, count error, count exact acc), one line per category + bold overall
+plotTestBoxplots: Box plots of per-batch localization and detection distributions on the test set
+plotPerCategoryMetrics: Grouped P/R/F1 bar chart per category (micro-averaged over test set), values annotated
+plotTPFPFN: Stacked TP/FP/FN bars per epoch — instantly reveals whether FP or FN is the dominant error
+plotTestErrorHistogram: Density histograms of Euc distance (mm) and per-axis X/Y error with mean±std annotations
+"""
+
+######Helper Functions#########
+def _loc_series(epoch_dicts, key):
+    """Extract a scalar localization metric across epoch dicts → np.array."""
+    out = []
+    for d in epoch_dicts:
+        v = d.get(key, float('nan'))
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            out.append(float('nan'))
+    return np.array(out)
+
+def _loc_series_axis(epoch_dicts, key, axis):
+    """Extract per-axis (0=X, 1=Y) localization metric across epoch dicts → np.array."""
+    out = []
+    for d in epoch_dicts:
+        v = d.get(key)
+        if v is None or not isinstance(v, (list, tuple)) or len(v) <= axis:
+            out.append(float('nan'))
+        else:
+            out.append(float(v[axis]))
+    return np.array(out)
+
+def _det_series(epoch_dicts, key, category='overall'):
+    """Extract a detection metric across epoch dicts → np.array."""
+    out = []
+    for d in epoch_dicts:
+        if category == 'overall':
+            v = d.get('overall', {}).get(key, float('nan'))
+        else:
+            v = d.get('per_category', {}).get(category, {}).get(key, float('nan'))
+        out.append(float(v) if v is not None else float('nan'))
+    return np.array(out)
+
+def _get_categories(det_logger):
+    """Discover category names from the first valid epoch dict."""
+    for d in det_logger:
+        cats = list(d.get('per_category', {}).keys())
+        if cats:
+            return cats
+    return []
+
+def _nan_safe_json(obj):
+    """Recursively convert float NaN → None for JSON serialisation."""
+    if isinstance(obj, dict):
+        return {k: _nan_safe_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_nan_safe_json(v) for v in obj]
+    if isinstance(obj, float) and np.isnan(obj):
+        return None
+    return obj
+
+def _safe_save(fig, save_file):
+    if save_file:
+        os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
+        fig.savefig(save_file, format='svg', dpi=600, bbox_inches='tight')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Statistics summary computation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def computeStats(test_logger, train_logger=None, valid_logger=None, save_file=None):
+    """
+    Compute, print and optionally save summary statistics.
+
+    Train / Valid loggers  → already per-epoch averages, read directly.
+    Test logger            → flat per-batch, micro-averaged here.
+    """
+    results = {}
+
+    # ── Test ─────────────────────────────────────────────────────────────────
+    if test_logger and test_logger.get('loss'):
+        loc_avg = average_localization_dict_serialized(test_logger['localization_dict'])
+        det_avg = average_detection_dict_overbatches(test_logger['detection_dict'])
+        pa = loc_avg.get('peraxis_mm_err_avg', [float('nan'), float('nan')])
+
+        results['test'] = {
+            'loss_mean':               float(np.nanmean(test_logger['loss'])),
+            'loss_std':                float(np.nanstd(test_logger['loss'])),
+            'euc_dist_mm_mean':        loc_avg.get('euc_dist_mm_avg',  float('nan')),
+            'euc_dist_mm_std':         loc_avg.get('euc_dist_mm_std',  float('nan')),
+            'euc_dist_px_mean':        loc_avg.get('euc_dist_px_avg',  float('nan')),
+            'peraxis_mm_x_mean':       float(pa[0]) if isinstance(pa, (list,tuple)) else float('nan'),
+            'peraxis_mm_y_mean':       float(pa[1]) if isinstance(pa, (list,tuple)) and len(pa)>1 else float('nan'),
+            'perc_err_mean':           loc_avg.get('perc_err', float('nan')),
+            'overall_precision':       det_avg.get('overall',{}).get('precision',        float('nan')),
+            'overall_recall':          det_avg.get('overall',{}).get('recall',           float('nan')),
+            'overall_f1':              det_avg.get('overall',{}).get('f1',               float('nan')),
+            'overall_count_err_mean':  det_avg.get('overall',{}).get('count_error_mean', float('nan')),
+            'overall_count_exact_acc': det_avg.get('overall',{}).get('count_exact_acc',  float('nan')),
+        }
+        for cat, cd in det_avg.get('per_category', {}).items():
+            results['test'][f'{cat}_precision'] = cd.get('precision', float('nan'))
+            results['test'][f'{cat}_recall']    = cd.get('recall',    float('nan'))
+            results['test'][f'{cat}_f1']        = cd.get('f1',        float('nan'))
+            results['test'][f'{cat}_count_err'] = cd.get('count_error_mean', float('nan'))
+
+        r = results['test']
+        print("="*60)
+        print("TEST RESULTS:")
+        print(f"  Loss                        : {r['loss_mean']:.4f} ± {r['loss_std']:.4f}")
+        print(f"  Euclidean Distance (mm)     : {r['euc_dist_mm_mean']:.4f} ± {r['euc_dist_mm_std']:.4f}")
+        print(f"  Euclidean Distance (px)     : {r['euc_dist_px_mean']:.4f}")
+        print(f"  Per-axis Error:       X (mm): {r['peraxis_mm_x_mean']:.4f}, Y (mm): {r['peraxis_mm_y_mean']:.4f}")
+        print(f"  Percentage Error            : {r['perc_err_mean']:.2f} %")
+        print(f"  Overall Precision           : {r['overall_precision']:.4f}")
+        print(f"  Overall Recall              : {r['overall_recall']:.4f}")
+        print(f"  Overall F1                  : {r['overall_f1']:.4f}")
+        print(f"  Count Error Mean            : {r['overall_count_err_mean']:.4f}")
+        print(f"  Count Exact Accuracy        : {r['overall_count_exact_acc']:.4f}")
+        for cat in det_avg.get('per_category', {}):
+            print(f"  [{cat:<10s}]: "
+                  f"P={r[f'{cat}_precision']:.4f}, "
+                  f"R={r[f'{cat}_recall']:.4f}, "
+                  f"F1={r[f'{cat}_f1']:.4f}, "
+                  f"CountErr={r[f'{cat}_count_err']:.3f}")
+
+    # ── Train / Valid  — already per-epoch averages, read directly ───────────
+    for split, logger in [('train', train_logger), ('valid', valid_logger)]:
+        if not logger or not logger.get('loss'):
+            continue
+
+        losses      = np.array(logger['loss'], dtype=np.float64)
+        best_epoch  = int(np.nanargmin(losses))
+        final_loc   = logger['localization_dict'][-1] if logger.get('localization_dict') else {}
+        final_det   = logger['detection_dict'][-1]    if logger.get('detection_dict')    else {}
+        best_epoch_loc=logger['localization_dict'][best_epoch] if logger.get('localization_dict') else {}
+        best_epoch_det=logger['detection_dict'][best_epoch] if logger.get('detection_dict') else {}
+        results[split] = {
+            'num_epochs':       len(losses),
+            'best_epoch':       best_epoch,
+            'best_epoch_loss':  float(losses[best_epoch]),
+            'best_epoch_euc_dist_mm':best_epoch_loc.get('euc_dist_mm_avg', float('nan')),
+            'best_epoch_precision':  best_epoch_det.get('overall', {}).get('precision', float('nan')),
+            'best_epoch_recall':     best_epoch_det.get('overall', {}).get('recall',    float('nan')),
+            'best_epoch_f1':         best_epoch_det.get('overall', {}).get('f1',        float('nan')),
+            'final_loss':       float(losses[-1]),
+            'final_euc_dist_mm':final_loc.get('euc_dist_mm_avg', float('nan')),
+            'final_precision':  final_det.get('overall', {}).get('precision', float('nan')),
+            'final_recall':     final_det.get('overall', {}).get('recall',    float('nan')),
+            'final_f1':         final_det.get('overall', {}).get('f1',        float('nan')),
+        }
+        r = results[split]
+        print("="*60)
+        print(f"  {split.upper()} RESULTS  (num_epochs: {r['num_epochs']}):")
+        print(f"  Best Epoch                  : {best_epoch} ")
+        print(f"  Best Epoch Loss             : {r['best_epoch_loss']:.4f} ")
+        print(f"  Best Euclidean Distance (mm): {r['best_epoch_euc_dist_mm']:.4f} ")
+        print(f"  Best Precision; Recall; F1  : "
+              f"{r['best_epoch_precision']:.4f}; {r['best_epoch_recall']:.4f}; {r['best_epoch_f1']:.4f}")
+        print(f"  Final Loss                  : {r['final_loss']:.4f}")
+        print(f"  Final Euclidean Dist (mm)   : {r['final_euc_dist_mm']:.4f}")
+        print(f"  Final Precision; Recall; F1 : "
+              f"{r['final_precision']:.4f}; {r['final_recall']:.4f}; {r['final_f1']:.4f}")
+
+    if save_file:
+        os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
+        with open(save_file, 'w') as f:
+            json.dump(_nan_safe_json(results), f, indent=2)
+        print(f"\n  Stats saved → {save_file}")
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Training Loss Plotter
+# ─────────────────────────────────────────────────────────────────────────────
+#Averaging helper:
+def _rolling(arr, w=5):
+    return np.convolve(arr, np.ones(w) / w, mode='valid')
+
+def plotTrainingLoss(train_logger, valid_logger=None, save_file=None):
+    """
+    Two-panel figure.
+    Left  : per-epoch mean loss for train (+ valid if supplied),
+            ±1 std shading using stored 'loss_std'.
+    Right : Smoothed version (5-epoch rolling mean) to show the trend
+            more clearly if training is noisy.
+    """
+    #Gets the per-epoch mean and std
+    train_means = np.array(train_logger.get('loss',     []), dtype=np.float64)
+    train_stds  = np.array(train_logger.get('loss_std', np.zeros(len(train_means))), dtype=np.float64)
+    if len(train_means) == 0:
+        return
+
+    #Number of epochs
+    epochs = np.arange(len(train_means))
+    best_valid_epoch = None
+
+    valid_means = valid_stds = v_epochs = None
+    if valid_logger and valid_logger.get('loss'):
+        valid_means      = np.array(valid_logger.get('loss',     []), dtype=np.float64)
+        valid_stds       = np.array(valid_logger.get('loss_std', np.zeros(len(valid_means))), dtype=np.float64)
+        v_epochs         = np.arange(len(valid_means))
+        best_valid_epoch = int(np.nanargmin(valid_means))
+
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle('Training Loss', fontsize=14, fontweight='bold')
+
+    # ── Left: mean ± std per epoch ───────────────────────────────────────────
+    axes[0].plot(epochs, train_means, color='steelblue', linewidth=2.0, label='Train')
+    axes[0].fill_between(epochs,
+                          np.maximum(0, train_means - train_stds),
+                          train_means + train_stds,
+                          color='steelblue', alpha=0.2)
+    if valid_means is not None:
+        axes[0].plot(v_epochs, valid_means, color='orangered', linewidth=2.0, label='Valid')
+        axes[0].fill_between(v_epochs,
+                              np.maximum(0, valid_means - valid_stds),
+                              valid_means + valid_stds,
+                              color='orangered', alpha=0.2)
+        axes[0].axvline(best_valid_epoch, color='orangered', linewidth=1.5,
+                        linestyle=':', label=f'Best valid epoch ({best_valid_epoch})')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Per-epoch Loss ± Batch Std')
+    axes[0].legend(fontsize=9)
+    axes[0].grid(True, alpha=0.3)
+
+    # ── Right: smoothed trend ────────────────────────────────────────────────
+    w = min(5, len(train_means))
+    sm_train = _rolling(train_means, w)
+    sm_ep    = np.arange(w - 1, len(train_means))
+    axes[1].plot(epochs, train_means, color='steelblue', linewidth=0.8, alpha=0.4)
+    axes[1].plot(sm_ep,  sm_train,    color='steelblue', linewidth=2.5, label=f'Train ({w}-ep smooth)')
+    if valid_means is not None and len(valid_means) >= w:
+        sm_valid = _rolling(valid_means, w)
+        axes[1].plot(v_epochs, valid_means, color='orangered', linewidth=0.8, alpha=0.4)
+        axes[1].plot(sm_ep, sm_valid, color='orangered', linewidth=2.5,
+                     label=f'Valid ({w}-ep smooth)')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Loss')
+    axes[1].set_title('Smoothed Loss Trend')
+    axes[1].legend(fontsize=9)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    _safe_save(fig, save_file)
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Localization Metrics vs Epoch Plotting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plotLocalizationMetrics(train_logger, valid_logger, save_file=None):
+    """
+    2-row × 5-col figure.  Top = train, Bottom = valid.
+    Logger localization_dict is already per-epoch averaged — used directly.
+    """
+    train_loc = train_logger.get('localization_dict', [])
+    valid_loc = valid_logger.get('localization_dict', [])
+    if not train_loc and not valid_loc:
+        return
+
+    t_ep = np.arange(len(train_loc))
+    v_ep = np.arange(len(valid_loc))
+
+    # (mean_key, std_key|None, axis_idx|None, y_label, title)
+    metrics = [
+        ('euc_dist_mm_avg',    'euc_dist_mm_std',    None, 'Distance (mm)', 'Euclidean Distance (mm)'),
+        ('euc_dist_px_avg',    'euc_dist_px_std',    None, 'Distance (px)', 'Euclidean Distance (px)'),
+        ('peraxis_mm_err_avg', 'peraxis_mm_err_std', 0,    'Error X (mm)',  'Per-axis Error X (mm)'),
+        ('peraxis_mm_err_avg', 'peraxis_mm_err_std', 1,    'Error Y (mm)',  'Per-axis Error Y (mm)'),
+        ('perc_err',            None,                None, 'Error (%)',     'Percentage Error (%)'),
+    ]
+
+    n_cols = len(metrics)
+    fig, axes = plt.subplots(2, n_cols, figsize=(4*n_cols,8))
+    fig.suptitle('Localization Metrics vs Epoch', fontsize=14, fontweight='bold')
+    # Add shared row labels on the left side
+    fig.text(0.01, 0.75, 'Train', va='center', rotation='vertical',
+            fontsize=13, fontweight='bold', color='steelblue')
+    fig.text(0.01, 0.25, 'Valid', va='center', rotation='vertical',
+            fontsize=13, fontweight='bold', color='orangered')
+
+    for col, (mean_key, std_key, axis_idx, ylabel, title) in enumerate(metrics):
+        for row, (loc_dicts, ep, color, label) in enumerate([
+            (train_loc, t_ep, 'steelblue', 'Train'),
+            (valid_loc, v_ep, 'orangered', 'Valid'),
+        ]):
+            ax = axes[row, col]
+            if axis_idx is not None:
+                means = _loc_series_axis(loc_dicts, mean_key, axis_idx)
+                stds  = _loc_series_axis(loc_dicts, std_key,  axis_idx) if std_key else None
+            else:
+                means = _loc_series(loc_dicts, mean_key)
+                stds  = _loc_series(loc_dicts, std_key)  if std_key else None
+
+            ax.plot(ep[:len(means)], means, color=color, linewidth=2.0, label='Mean')
+            if stds is not None:
+                ax.fill_between(ep[:len(means)],
+                                np.maximum(0, means - stds),
+                                means + stds,
+                                color=color, alpha=0.2, label='±1 std')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel(ylabel)
+            ax.set_title(f'{title}')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    _safe_save(fig, save_file)
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Detection Metrics vs Epoch Plotting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plotDetectionMetrics(train_logger, valid_logger, save_file=None):
+    """
+    2-row × 5-col figure.  Top = train, Bottom = valid.
+    Each subplot: bold black = overall, dashed coloured = per-category.
+    Logger detection_dict is already per-epoch averaged — used directly.
+    """
+    train_det = train_logger.get('detection_dict', [])
+    valid_det = valid_logger.get('detection_dict', [])
+    if not train_det and not valid_det:
+        return
+
+    all_cats   = _get_categories(train_det or valid_det)
+    cat_colors = cm.tab10(np.linspace(0.0, 0.7, max(len(all_cats), 1)))
+    t_ep = np.arange(len(train_det))
+    v_ep = np.arange(len(valid_det))
+
+    det_metrics = [
+        ('precision',        'Precision',         (0.0, 1.05)),
+        ('recall',           'Recall',             (0.0, 1.05)),
+        ('f1',               'F1 Score',           (0.0, 1.05)),
+        ('count_error_mean', 'Count Error (mean)', None),
+        ('count_exact_acc',  'Count Exact Acc',    (0.0, 1.05)),
+    ]
+
+    n_cols = len(det_metrics)
+    fig, axes = plt.subplots(2, n_cols, figsize=(4*n_cols,8))
+    fig.suptitle('Detection Metrics vs Epoch', fontsize=14, fontweight='bold')
+    # Add shared row labels on the left side
+    fig.text(0.01, 0.75, 'Train', va='center', rotation='vertical',
+            fontsize=13, fontweight='bold', color='steelblue')
+    fig.text(0.01, 0.25, 'Valid', va='center', rotation='vertical',
+            fontsize=13, fontweight='bold', color='orangered')
+
+    for col, (metric_key, ylabel, ylim) in enumerate(det_metrics):
+        for row, (det_dicts, ep, split_label) in enumerate([
+            (train_det, t_ep, 'Train'),
+            (valid_det, v_ep, 'Valid'),
+        ]):
+            ax = axes[row, col]
+            overall_vals = _det_series(det_dicts, metric_key, 'overall')
+            ax.plot(ep[:len(overall_vals)], overall_vals,
+                    color='black', linewidth=2.5, linestyle='-', label='Overall', zorder=3)
+            for cat, color in zip(all_cats, cat_colors):
+                cat_vals = _det_series(det_dicts, metric_key, cat)
+                ax.plot(ep[:len(cat_vals)], cat_vals,
+                        color=color, linewidth=1.8, linestyle='--', label=cat.capitalize())
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel(ylabel)
+            ax.set_title(f'{ylabel}')
+            if ylim:
+                ax.set_ylim(*ylim)
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    _safe_save(fig, save_file)
+    plt.close(fig)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Test-set box plots  (per-batch distributions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plotTestBoxplots(test_logger, save_file=None):
+    """
+    Box plots of per-batch test metrics. Each box captures the distribution of
+    batch-level means across the test set.
+
+    Left panel  : localization metrics
+    Right panel : detection metrics — overall then per-category
+
+    Parameters
+    ----------
+    test_logger : dict  Flat per-batch logger from modelTester.
+    save_file   : str   (optional) SVG save path.
+    """
+    loc_dicts = test_logger.get('localization_dict', [])
+    det_dicts = test_logger.get('detection_dict',    [])
+    if not loc_dicts or not det_dicts:
+        return
+
+    def _pa(d, i):
+        v = d.get('peraxis_mm_err_avg')
+        return float(v[i]) if isinstance(v, (list, tuple)) and len(v) > i else np.nan
+
+    def _clean(lst):
+        return [v for v in lst if not np.isnan(float(v))]
+
+    # ── Localization data ────────────────────────────────────────────────────
+    euc_mm  = [d.get('euc_dist_mm_avg', np.nan) for d in loc_dicts]
+    axis_x  = [_pa(d, 0) for d in loc_dicts]
+    axis_y  = [_pa(d, 1) for d in loc_dicts]
+    euc_px  = [d.get('euc_dist_px_avg', np.nan) for d in loc_dicts]
+    perc    = [d.get('perc_err',        np.nan) for d in loc_dicts]
+
+    loc_data   = [euc_mm, axis_x, axis_y, euc_px, perc]
+    loc_labels = ['Euc\n(mm)', 'X Err\n(mm)', 'Y Err\n(mm)', 'Euc\n(px)', '% Err']
+
+    # ── Detection data ───────────────────────────────────────────────────────
+    all_cats = list(det_dicts[0].get('per_category', {}).keys()) if det_dicts else []
+
+    def _dget(key, cat='overall'):
+        if cat == 'overall':
+            return [d.get('overall', {}).get(key, np.nan) for d in det_dicts]
+        return [d.get('per_category', {}).get(cat, {}).get(key, np.nan) for d in det_dicts]
+
+    det_data   = [_dget('precision'), _dget('recall'), _dget('f1')]
+    det_labels = ['Overall\nP', 'Overall\nR', 'Overall\nF1']
+    det_colors = ['steelblue'] * 3
+
+    cat_colors = cm.tab10(np.linspace(0.0, 0.7, max(len(all_cats), 1)))
+    for cat, c in zip(all_cats, cat_colors):
+        det_data   += [_dget('precision', cat), _dget('recall', cat), _dget('f1', cat)]
+        det_labels += [f'{cat.capitalize()}\nP', f'{cat.capitalize()}\nR', f'{cat.capitalize()}\nF1']
+        det_colors += [c, c, c]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle('Test Set — Per-batch Metric Distributions', fontsize=13, fontweight='bold')
+
+    # Left: localization
+    bp_loc = axes[0].boxplot([_clean(d) for d in loc_data],
+                              labels=loc_labels, patch_artist=True)
+    loc_box_colors = cm.Blues(np.linspace(0.35, 0.75, len(loc_data)))
+    for patch, fc in zip(bp_loc['boxes'], loc_box_colors):
+        patch.set_facecolor(fc)
+    axes[0].set_title('Localization Errors')
+    axes[0].set_ylabel('Error')
+    axes[0].grid(True, alpha=0.3, axis='y')
+
+    # Right: detection
+    bp_det = axes[1].boxplot([_clean(d) for d in det_data],
+                              labels=det_labels, patch_artist=True)
+    for patch, fc in zip(bp_det['boxes'], det_colors):
+        patch.set_facecolor(fc)
+        patch.set_alpha(0.75)
+    axes[1].set_title('Detection Metrics')
+    axes[1].set_ylabel('Score')
+    axes[1].set_ylim(-0.05, 1.1)
+    axes[1].grid(True, alpha=0.3, axis='y')
+    plt.setp(axes[1].get_xticklabels(), fontsize=8)
+
+    plt.tight_layout()
+    _safe_save(fig, save_file)
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Per-category grouped bar chart  (test set)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plotPerCategoryMetrics_Test(test_logger, save_file=None):
+    """
+    Grouped bar chart comparing Precision / Recall / F1 for Overall and each
+    category, computed via micro-averaging over the full test set.
+
+    Parameters
+    ----------
+    test_logger : dict  Flat per-batch logger from modelTester.
+    save_file   : str   (optional) SVG save path.
+    """
+    det_avg = average_detection_dict_overbatches(test_logger.get('detection_dict', []))
+    if not det_avg:
+        return
+
+    overall  = det_avg.get('overall', {})
+    per_cat  = det_avg.get('per_category', {})
+
+    groups     = ['Overall'] + [c.capitalize() for c in per_cat]
+    precisions = [overall.get('precision', np.nan)] + [per_cat[c].get('precision', np.nan) for c in per_cat]
+    recalls    = [overall.get('recall',    np.nan)] + [per_cat[c].get('recall',    np.nan) for c in per_cat]
+    f1s        = [overall.get('f1',        np.nan)] + [per_cat[c].get('f1',        np.nan) for c in per_cat]
+
+    x     = np.arange(len(groups))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(max(8, 3 * len(groups)), 5))
+    bars_p = ax.bar(x - width, precisions, width, label='Precision', color='steelblue', alpha=0.85)
+    bars_r = ax.bar(x,         recalls,    width, label='Recall',    color='orangered', alpha=0.85)
+    bars_f = ax.bar(x + width, f1s,        width, label='F1',        color='seagreen',  alpha=0.85)
+
+    for bars in (bars_p, bars_r, bars_f):
+        ax.bar_label(bars, fmt='%.3f', fontsize=8, padding=2)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, fontsize=11)
+    ax.set_ylabel('Score')
+    ax.set_title('Test Set: Detection Metrics by Category')
+    ax.set_ylim(0, 1.18)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    _safe_save(fig, save_file)
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  TP / FP / FN stacked bars vs epoch for training and validation sets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plotTPFPFN_TrainValid(train_logger, valid_logger=None, save_file=None):
+    """
+    Stacked bar chart of cumulative TP / FP / FN per epoch (overall).
+
+    Since TP/FP/FN are summed across batches within each epoch by the
+    aggregation helpers, the bar heights reflect total detection counts
+    for that epoch. Growing TP with shrinking FP/FN indicates the model
+    is learning. Helps distinguish precision vs recall as the primary bottleneck.
+
+    Parameters
+    ----------
+    train_logger : dict  Epoch-nested logger from ModelTrainer.
+    valid_logger : dict  (optional) Same structure.
+    save_file    : str   (optional) SVG save path.
+    """
+    def _extract_counts(logger):
+        epoch_dicts = average_detection_dict_overbatches(logger.get('detection_dict', []))
+        tp = np.array([d.get('overall', {}).get('tp', 0) for d in epoch_dicts])
+        fp = np.array([d.get('overall', {}).get('fp', 0) for d in epoch_dicts])
+        fn = np.array([d.get('overall', {}).get('fn', 0) for d in epoch_dicts])
+        return tp, fp, fn
+
+    has_valid = valid_logger is not None and valid_logger.get('detection_dict')
+    n_cols    = 2 if has_valid else 1
+
+    fig, axes = plt.subplots(1, n_cols, figsize=(8 * n_cols, 5))
+    if n_cols == 1:
+        axes = [axes]
+    fig.suptitle('TP / FP / FN per Epoch (Overall)', fontsize=13, fontweight='bold')
+
+    pairs = [(train_logger, 'Training')]
+    if has_valid:
+        pairs.append((valid_logger, 'Validation'))
+
+    for ax, (logger, title) in zip(axes, pairs):
+        tp, fp, fn = _extract_counts(logger)
+        ep = np.arange(len(tp))
+        ax.bar(ep, tp,          label='TP', color='seagreen',  alpha=0.85)
+        ax.bar(ep, fp, bottom=tp,          label='FP', color='steelblue', alpha=0.85)
+        ax.bar(ep, fn, bottom=tp + fp,     label='FN', color='tomato',    alpha=0.85)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Count (summed across batches)')
+        ax.set_title(title)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    _safe_save(fig, save_file)
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  Test-set error histograms
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plotTestErrorHistogram(test_logger, save_file=None):
+    """
+    Histograms of per-batch test localization errors with mean / ±1 std annotations.
+    Particularly useful for ultrasound where understanding the mm error distribution
+    is clinically relevant.
+
+    Left  : Euclidean distance distribution (mm)
+    Right : Per-axis X vs Y error distribution (mm) — overlaid histograms
+
+    Parameters
+    ----------
+    test_logger : dict  Flat per-batch logger from modelTester.
+    save_file   : str   (optional) SVG save path.
+    """
+    loc_dicts = test_logger.get('localization_dict', [])
+    if not loc_dicts:
+        return
+
+    def _pa(d, i):
+        v = d.get('peraxis_mm_err_avg')
+        return float(v[i]) if isinstance(v, (list, tuple)) and len(v) > i else np.nan
+
+    euc_mm  = np.array([d.get('euc_dist_mm_avg', np.nan) for d in loc_dicts], dtype=np.float64)
+    axis_x  = np.array([_pa(d, 0) for d in loc_dicts], dtype=np.float64)
+    axis_y  = np.array([_pa(d, 1) for d in loc_dicts], dtype=np.float64)
+
+    euc_mm = euc_mm[~np.isnan(euc_mm)]
+    axis_x = axis_x[~np.isnan(axis_x)]
+    axis_y = axis_y[~np.isnan(axis_y)]
+
+    if len(euc_mm) == 0:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle('Test Set — Error Distributions (per-batch means)', fontsize=13, fontweight='bold')
+
+    # ── Left: Euclidean distance ─────────────────────────────────────────────
+    axes[0].hist(euc_mm, bins=30, color='steelblue', alpha=0.7,
+                 edgecolor='white', density=True)
+    mean_val, std_val = euc_mm.mean(), euc_mm.std()
+    axes[0].axvline(mean_val,           color='black', linewidth=2.0, linestyle='-',
+                    label=f'Mean = {mean_val:.2f} mm')
+    axes[0].axvline(mean_val - std_val, color='gray',  linewidth=1.5, linestyle='--',
+                    label=f'±1 std ({std_val:.2f} mm)')
+    axes[0].axvline(mean_val + std_val, color='gray',  linewidth=1.5, linestyle='--')
+    axes[0].set_xlabel('Euclidean Distance (mm)')
+    axes[0].set_ylabel('Density')
+    axes[0].set_title('Euclidean Distance Error (mm)')
+    axes[0].legend(fontsize=9)
+    axes[0].grid(True, alpha=0.3)
+
+    # ── Right: Per-axis X vs Y ───────────────────────────────────────────────
+    all_ax = np.concatenate([axis_x, axis_y])
+    bins = np.histogram_bin_edges(all_ax[~np.isnan(all_ax)], bins=30)
+    axes[1].hist(axis_x, bins=bins, color='steelblue', alpha=0.65, edgecolor='white',
+                 density=True, label=f'X  mean={axis_x.mean():.2f} mm')
+    axes[1].hist(axis_y, bins=bins, color='orangered', alpha=0.65, edgecolor='white',
+                 density=True, label=f'Y  mean={axis_y.mean():.2f} mm')
+    axes[1].axvline(axis_x.mean(), color='steelblue', linewidth=1.8, linestyle='--')
+    axes[1].axvline(axis_y.mean(), color='orangered', linewidth=1.8, linestyle='--')
+    axes[1].set_xlabel('Per-axis Error (mm)')
+    axes[1].set_ylabel('Density')
+    axes[1].set_title('Per-axis Error Distribution (mm)')
+    axes[1].legend(fontsize=9)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    _safe_save(fig, save_file)
+    plt.close(fig)
