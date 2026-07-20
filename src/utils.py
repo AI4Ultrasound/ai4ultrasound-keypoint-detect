@@ -888,8 +888,8 @@ def hungarian_match_single(pred_kps, pred_cats_logits, target_kps, target_cats, 
     N_real = real_tgt_idx.shape[0]
     K_pred = pred_kps.shape[0]
     if N_real == 0 or K_pred==0:
-        return (torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long)) #Returns empty indexes if there are no visible or predicted keypoints
+        return (torch.empty(0, dtype=torch.long,device=pred_kps.device),
+                torch.empty(0, dtype=torch.long,device=pred_kps.device)) #Returns empty indexes if there are no visible or predicted keypoints
 
     
 
@@ -917,8 +917,8 @@ def hungarian_match_single(pred_kps, pred_cats_logits, target_kps, target_cats, 
     # Solve on CPU (scipy requirement)
     pred_i, tgt_j = linear_sum_assignment(cost.detach().cpu().numpy())
 
-    pred_i = torch.tensor(pred_i, dtype=torch.long)
-    tgt_j  = real_tgt_idx[torch.tensor(tgt_j, dtype=torch.long)]
+    pred_i = torch.tensor(pred_i, dtype=torch.long,device=pred_kps.device)
+    tgt_j  = real_tgt_idx[torch.tensor(tgt_j, dtype=torch.long,device=pred_kps.device)]
     return pred_i, tgt_j
 
 def apply_hungarian_matching( pred, pred_cats_logits, target, visibility, areas, categories):
@@ -1014,6 +1014,9 @@ def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, 
     scale_x = W_out / W_in
     scale_y = H_out / H_in
 
+    cx = keypoints[:, :, 0] * scale_x  # (B, K)
+    cy = keypoints[:, :, 1] * scale_y  # (B, K)
+
     yy = torch.arange(H_out, dtype=torch.float32, device=device)
     xx = torch.arange(W_out, dtype=torch.float32, device=device)
     grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')   # (H_out, W_out)
@@ -1022,26 +1025,28 @@ def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, 
                                 dtype=torch.float32, device=device)
     target_weight = torch.zeros(B, num_categories,
                                 dtype=torch.float32, device=device)
+    
+    vis_mask = visibility.bool() & (categories > 0)
 
-    for b in range(B):
-        for k in range(K):
-            if not visibility[b, k]:
-                continue
-            cat_idx = int(categories[b, k].item()) - 1    # 1→0, 2→1
-            if cat_idx < 0:
-                continue   # padded slot
+    for cat in range(num_categories):
+        # Boolean mask for keypoints belonging to this category: (B, K)
+        cat_mask = vis_mask & (categories == (cat + 1))
+        if not cat_mask.any():
+            continue
 
-            cx = keypoints[b, k, 0].item() * scale_x
-            cy = keypoints[b, k, 1].item() * scale_y
+        # Broadcast: cx/cy (B,K,1,1) vs grid (1,1,H,W) → Gaussian (B,K,H,W)
+        gauss = torch.exp(
+            -(  (grid_x[None, None] - cx[:, :, None, None]) ** 2
+              + (grid_y[None, None] - cy[:, :, None, None]) ** 2 )
+            / (2.0 * heatmap_sigma ** 2)
+        )  # (B, K, H_out, W_out)
 
-            gauss = torch.exp(
-                -((grid_x - cx) ** 2 + (grid_y - cy) ** 2)
-                / (2.0 * heatmap_sigma ** 2)
-            )   # (H_out, W_out)
+        # Zero out keypoints not in this category, then max-blend over K
+        gauss = gauss * cat_mask[:, :, None, None].float()  # (B, K, H_out, W_out)
+        heatmaps[:, cat] = gauss.max(dim=1).values           # (B, H_out, W_out)
 
-            # max-blend: N keypoints of the same category → N distinct peaks
-            heatmaps[b, cat_idx]      = torch.max(heatmaps[b, cat_idx], gauss)
-            target_weight[b, cat_idx] = 1.0
+        # Channel is active if any keypoint in that image belongs to this category
+        target_weight[:, cat] = cat_mask.any(dim=1).float()  # (B,)
 
     return heatmaps, target_weight
 
@@ -1088,9 +1093,9 @@ def decode_heatmaps(heatmaps, H_in, W_in,
                     dy = hmap[py + 1, px] - hmap[py - 1, px]
                     ry += 0.25 * dy.sign().item()
                 kps_b.append(
-                    torch.tensor([[rx * scale_x, ry * scale_y]], dtype=torch.float32)
+                    torch.tensor([[rx * scale_x, ry * scale_y]], dtype=torch.float32,device=heatmaps.device)
                 )
-                cats_b.append(torch.tensor([c + 1], dtype=torch.long))
+                cats_b.append(torch.tensor([c + 1], dtype=torch.long,device=heatmaps.device))
                 scores_b.append(score)
 
 
@@ -1098,13 +1103,13 @@ def decode_heatmaps(heatmaps, H_in, W_in,
             pred_kps_list.append(torch.cat(kps_b,    dim=0))
             pred_cats_list.append(torch.cat(cats_b,  dim=0))
             pred_scores_list.append(
-                torch.tensor(scores_b, dtype=torch.float32)   # (N,)
+                torch.tensor(scores_b, dtype=torch.float32,device=heatmaps.device)   # (N,)
             )
         else:
             # Image has zero detections — return empty tensors so indexing is safe
-            pred_kps_list.append(torch.zeros(0, 2))
-            pred_cats_list.append(torch.zeros(0, dtype=torch.long))
-            pred_scores_list.append(torch.zeros(0))
+            pred_kps_list.append(torch.zeros(0, 2,device=heatmaps.device))
+            pred_cats_list.append(torch.zeros(0, dtype=torch.long,device=heatmaps.device))
+            pred_scores_list.append(torch.zeros(0,device=heatmaps.device))
 
     return pred_kps_list,pred_cats_list,pred_scores_list
 
@@ -1240,6 +1245,11 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
                 pred_kps_batch[b,  :n] = pred_list[b]
                 pred_cats_batch[b, :n] = pred_categories_list[b]
                 pred_vis_batch[b,  :n] = True
+
+        #Update the variables
+        pred=pred_kps_batch
+        pred_cats_labels=pred_cats_batch
+        pred_vis=pred_vis_batch
         
     else: #fixed or hungarian (model predicts keypoints)
         if pred_categories is not None:
@@ -1287,14 +1297,14 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
         (((matched_pred-matched_tgt)**2)*vis_mask).sum(dim=2)
         ) #Euclidean dist across (B_eff,K)
     euc_dist_px_avg=euc_dist_px.sum()/n_vis
-    euc_dist_px_std=euc_dist_px.flatten()[vis_flat].std() #Gets the standard deviation of only visible points
+    euc_dist_px_std=euc_dist_px.flatten()[vis_flat].std(correction=0) #Gets the standard deviation of only visible points
 
     #Compute per-axis pixel error
     peraxis_px_err=torch.abs(matched_pred-matched_tgt)*vis_mask #(B_eff,K,2)
     peraxis_px_err_avg = peraxis_px_err.sum(dim=(0, 1)) / n_vis
     peraxis_flat=peraxis_px_err.reshape(-1, 2)     # (B_eff*K, 2)
     visible_errors   = peraxis_flat[vis_flat] #(n_vis,2)
-    peraxis_px_err_std=visible_errors.std(dim=0) #Per-axis std (2,)
+    peraxis_px_err_std=visible_errors.std(dim=0,correction=0) #Per-axis std (2,)
 
     #Errors in mm
     matched_pred_mm=matched_pred*scale
@@ -1305,11 +1315,14 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
         (((matched_pred_mm-matched_tgt_mm)**2)*vis_mask).sum(dim=2)
         ) #Euclidean dist across (B_eff,K)
     euc_dist_mm_avg=euc_dist_mm.sum()/n_vis
-    euc_dist_mm_std=euc_dist_mm.flatten()[vis_flat].std()
+    euc_dist_mm_std=euc_dist_mm.flatten()[vis_flat].std(correction=0)
 
     #Compute per-axis mm error
-    peraxis_mm_err_avg=peraxis_px_err_avg*scale
-    peraxis_mm_err_std=peraxis_px_err_std*scale
+    peraxis_mm_err= torch.abs(matched_pred_mm - matched_tgt_mm) * vis_mask  # (B_eff, K, 2)
+    peraxis_mm_err_avg= peraxis_mm_err.sum(dim=(0, 1)) / n_vis                  # (2,)
+    peraxis_mm_flat= peraxis_mm_err.reshape(-1, 2)                            # (B_eff*K, 2)
+    visible_mm_errors= peraxis_mm_flat[vis_flat]                                # (n_vis, 2)
+    peraxis_mm_err_std= visible_mm_errors.std(dim=0,correction=0)                             # (2,)
     #Compute the percentage error (euclidean pixel error divided by maximum diagonal)
 
     perc_err=(float(euc_dist_px_avg)/max_diagnoal)*100.0
@@ -1443,7 +1456,7 @@ def _localization_dict_to_serializable(d):
             out[k] = v
     return out
 
-def average_localization_dict_overbatches(self,localization_dict_list):
+def average_localization_dict_overbatches(localization_dict_list):
     """
     localization_dict_list is a list of localization_dict's from calculateError, we want to get average of each value across all the batches that we accumulate this list of dicts
     """
@@ -1469,7 +1482,6 @@ def average_localization_dict_overbatches(self,localization_dict_list):
             result[key] = avg
 
         else:
-            # FIX 2: nanmean excludes NaN stds rather than propagating them
             arr = np.array([float(v) for v in values], dtype=np.float64)
             result[key] = float(np.nanmean(arr))
 
@@ -1494,7 +1506,7 @@ def average_localization_dict_serialized(localization_dict_list):
             result[key] = float(np.nanmean(np.array([float(v) for v in vals], dtype=np.float64)))
     return result
 
-def average_detection_dict_overbatches(self,detect_dict_list):
+def average_detection_dict_overbatches(detect_dict_list):
     """
     Aggregates detection metrics across batches.
 
@@ -1533,7 +1545,7 @@ def average_detection_dict_overbatches(self,detect_dict_list):
 
 
 #Helpers for computing gaverages of the detection dict:
-def _recompute_prf(self,tp, fp, fn):
+def _recompute_prf(tp, fp, fn):
     """Recompute precision / recall / F1 from accumulated counts."""
     precision = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
     recall    = tp / (tp + fn) if (tp + fn) > 0 else float('nan')
@@ -1546,7 +1558,7 @@ def _recompute_prf(self,tp, fp, fn):
     return precision, recall, f1
 
 
-def _aggregate_bucket(self,bucket_dicts):
+def _aggregate_bucket(bucket_dicts):
     """
     Aggregate a list of same-bucket metric dicts from successive batches.
 
@@ -1721,28 +1733,45 @@ def computeStats(test_logger, train_logger=None, valid_logger=None, save_file=No
 
     # ── Train / Valid  — already per-epoch averages, read directly ───────────
     for split, logger in [('train', train_logger), ('valid', valid_logger)]:
-        if not logger or not logger.get('loss'):
+        if logger is None or not logger.get('loss'):
             continue
+        raw_losses = logger['loss']
 
-        losses      = np.array(logger['loss'], dtype=np.float64)
-        best_epoch  = int(np.nanargmin(losses))
-        final_loc   = logger['localization_dict'][-1] if logger.get('localization_dict') else {}
-        final_det   = logger['detection_dict'][-1]    if logger.get('detection_dict')    else {}
-        best_epoch_loc=logger['localization_dict'][best_epoch] if logger.get('localization_dict') else {}
-        best_epoch_det=logger['detection_dict'][best_epoch] if logger.get('detection_dict') else {}
+        if raw_losses and isinstance(raw_losses[0], list):
+            epoch_losses = np.array(
+                [np.nanmean(ep) for ep in raw_losses], dtype=np.float64
+            )
+        else:
+            # already per-epoch scalars
+            epoch_losses = np.array(raw_losses, dtype=np.float64)
+
+        best_epoch = int(np.nanargmin(epoch_losses))
+        n_loc = len(logger.get('localization_dict', []))
+        n_det = len(logger.get('detection_dict',    []))
+
+        # Guard: localization_dict / detection_dict may have fewer entries
+        # than loss if some epochs were skipped during metric computation
+        safe_best_loc = min(best_epoch, n_loc - 1) if n_loc > 0 else -1
+        safe_best_det = min(best_epoch, n_det - 1) if n_det > 0 else -1
+
+        final_loc      = logger['localization_dict'][-1] if n_loc > 0 else {}
+        final_det      = logger['detection_dict'][-1]    if n_det > 0 else {}
+        best_epoch_loc = logger['localization_dict'][safe_best_loc] if safe_best_loc >= 0 else {}
+        best_epoch_det = logger['detection_dict'][safe_best_det]    if safe_best_det >= 0 else {}
+
         results[split] = {
-            'num_epochs':       len(losses),
-            'best_epoch':       best_epoch,
-            'best_epoch_loss':  float(losses[best_epoch]),
-            'best_epoch_euc_dist_mm':best_epoch_loc.get('euc_dist_mm_avg', float('nan')),
+            'num_epochs':            len(epoch_losses),
+            'best_epoch':            best_epoch,
+            'best_epoch_loss':       float(epoch_losses[best_epoch]),
+            'best_epoch_euc_dist_mm': best_epoch_loc.get('euc_dist_mm_avg', float('nan')),
             'best_epoch_precision':  best_epoch_det.get('overall', {}).get('precision', float('nan')),
             'best_epoch_recall':     best_epoch_det.get('overall', {}).get('recall',    float('nan')),
             'best_epoch_f1':         best_epoch_det.get('overall', {}).get('f1',        float('nan')),
-            'final_loss':       float(losses[-1]),
-            'final_euc_dist_mm':final_loc.get('euc_dist_mm_avg', float('nan')),
-            'final_precision':  final_det.get('overall', {}).get('precision', float('nan')),
-            'final_recall':     final_det.get('overall', {}).get('recall',    float('nan')),
-            'final_f1':         final_det.get('overall', {}).get('f1',        float('nan')),
+            'final_loss':            float(epoch_losses[-1]),
+            'final_euc_dist_mm':     final_loc.get('euc_dist_mm_avg', float('nan')),
+            'final_precision':       final_det.get('overall', {}).get('precision', float('nan')),
+            'final_recall':          final_det.get('overall', {}).get('recall',    float('nan')),
+            'final_f1':              final_det.get('overall', {}).get('f1',        float('nan')),
         }
         r = results[split]
         print("="*60)
@@ -1771,7 +1800,11 @@ def computeStats(test_logger, train_logger=None, valid_logger=None, save_file=No
 # ─────────────────────────────────────────────────────────────────────────────
 #Averaging helper:
 def _rolling(arr, w=5):
-    return np.convolve(arr, np.ones(w) / w, mode='valid')
+    """Rolling mean from epoch 0 using expanding window for first w-1 epochs."""
+    out = np.zeros(len(arr))
+    for i in range(len(arr)):
+        out[i] = np.nanmean(arr[max(0, i - w + 1): i + 1])
+    return out
 
 def plotTrainingLoss(train_logger, valid_logger=None, save_file=None):
     """
@@ -1781,9 +1814,15 @@ def plotTrainingLoss(train_logger, valid_logger=None, save_file=None):
     Right : Smoothed version (5-epoch rolling mean) to show the trend
             more clearly if training is noisy.
     """
+    raw_train = train_logger.get('loss', [])
+    if not raw_train:
+        return
     #Gets the per-epoch mean and std
-    train_means = np.array(train_logger.get('loss',     []), dtype=np.float64)
-    train_stds  = np.array(train_logger.get('loss_std', np.zeros(len(train_means))), dtype=np.float64)
+    if isinstance(raw_train[0], list):
+        train_means = np.array([np.nanmean(ep) for ep in raw_train], dtype=np.float64)
+    else:
+        train_means = np.array(raw_train, dtype=np.float64)
+    train_stds = np.array(train_logger.get('loss_std', np.zeros(len(train_means))), dtype=np.float64)
     if len(train_means) == 0:
         return
 
@@ -1793,7 +1832,11 @@ def plotTrainingLoss(train_logger, valid_logger=None, save_file=None):
 
     valid_means = valid_stds = v_epochs = None
     if valid_logger and valid_logger.get('loss'):
-        valid_means      = np.array(valid_logger.get('loss',     []), dtype=np.float64)
+        raw_valid = valid_logger.get('loss', [])
+        if isinstance(raw_valid[0], list):
+            valid_means = np.array([np.nanmean(ep) for ep in raw_valid], dtype=np.float64)
+        else:
+            valid_means = np.array(raw_valid, dtype=np.float64)
         valid_stds       = np.array(valid_logger.get('loss_std', np.zeros(len(valid_means))), dtype=np.float64)
         v_epochs         = np.arange(len(valid_means))
         best_valid_epoch = int(np.nanargmin(valid_means))
@@ -1825,9 +1868,8 @@ def plotTrainingLoss(train_logger, valid_logger=None, save_file=None):
     # ── Right: smoothed trend ────────────────────────────────────────────────
     w = min(5, len(train_means))
     sm_train = _rolling(train_means, w)
-    sm_ep    = np.arange(w - 1, len(train_means))
     axes[1].plot(epochs, train_means, color='steelblue', linewidth=0.8, alpha=0.4)
-    axes[1].plot(sm_ep,  sm_train,    color='steelblue', linewidth=2.5, label=f'Train ({w}-ep smooth)')
+    axes[1].plot(epochs,  sm_train,    color='steelblue', linewidth=2.5, label=f'Train ({w}-ep smooth)')
     if valid_means is not None and len(valid_means) >= w:
         sm_valid = _rolling(valid_means, w)
         axes[1].plot(v_epochs, valid_means, color='orangered', linewidth=0.8, alpha=0.4)
@@ -2128,7 +2170,7 @@ def plotTPFPFN_TrainValid(train_logger, valid_logger=None, save_file=None):
     save_file    : str   (optional) SVG save path.
     """
     def _extract_counts(logger):
-        epoch_dicts = average_detection_dict_overbatches(logger.get('detection_dict', []))
+        epoch_dicts = logger.get('detection_dict', [])   # ← remove the averaging call
         tp = np.array([d.get('overall', {}).get('tp', 0) for d in epoch_dicts])
         fp = np.array([d.get('overall', {}).get('fp', 0) for d in epoch_dicts])
         fn = np.array([d.get('overall', {}).get('fn', 0) for d in epoch_dicts])

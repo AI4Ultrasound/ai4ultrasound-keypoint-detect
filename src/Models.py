@@ -2,10 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
-from mmengine.config import Config
-from mmpose.models.backbones import HRNet
-from mmpose.models.heads import HeatmapHead
-from mmengine.runner import load_checkpoint
 from mmpose.apis import init_model
 from mim import download as mim_download
 
@@ -22,7 +18,9 @@ _HRNET_W48_OUT_CH = 48
 
 
 class HRNet_UDP(nn.Module):
-    def __init__(self,model_type,device,return_mode='frame',num_categories=1,in_channels=1,mmpose_config=None,pretrained_backbone=None,mmpose_cache_dir='mmpose_model_cache'):
+    def __init__(self,model_type,device,return_mode='frame',num_categories=1,in_channels=1,mmpose_config=None,
+                 pretrained_backbone=None,mmpose_cache_dir='mmpose_model_cache',
+                 heatmap_head_dropout=0.3):
         """
         Wraps MMPose's HRNet-W48 UDP with a lightweight custom heatmap head. 
 
@@ -40,6 +38,7 @@ class HRNet_UDP(nn.Module):
         self.device=device
         self.num_categories=num_categories
         self.in_channels=in_channels
+        self.heatmap_head_dropout=heatmap_head_dropout
 
 
         if self.model_type=='pose_hrnet_w48_udp':
@@ -152,6 +151,7 @@ class HRNet_UDP(nn.Module):
                       kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(_HRNET_W48_OUT_CH),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=self.heatmap_head_dropout),
             nn.Conv2d(_HRNET_W48_OUT_CH, self.num_categories, kernel_size=1),
         )
 

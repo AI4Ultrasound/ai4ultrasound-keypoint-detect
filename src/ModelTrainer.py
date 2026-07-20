@@ -61,7 +61,7 @@ class ModelTrainer(nn.Module):
         self.best_valid_loss=float(10000.0) #Keep model with best validation loss
 
         #Logger save path (saved at end of training)
-        logger_save_dir=os.path.join('logs',model_name_save)
+        logger_save_dir=os.path.join('../logs',model_name_save)
         if not os.path.isdir(logger_save_dir):
             os.makedirs(logger_save_dir,exist_ok=True)
         
@@ -92,7 +92,7 @@ class ModelTrainer(nn.Module):
 
     def loadCheckpoint(self):
         #Loads from checkpoint if we are doing that
-        checkpoint=torch.load(self.checkpoint_loadpath,, map_location=self.device, weights_only=False)
+        checkpoint=torch.load(self.checkpoint_loadpath, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])  
         self.model=self.model.to(self.device)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict']) 
@@ -349,7 +349,7 @@ class ModelTrainer(nn.Module):
                 continue
             
             #Compute average of the localization and detection dicts for validation
-            valid_localization_dict_avg=utils.average_localization_dict_overbatches(epoch_valid['localization_dict'])
+            valid_localization_dict_avg=utils.average_localization_dict_serialized(epoch_valid['localization_dict'])
             valid_detection_dict_avg=utils.average_detection_dict_overbatches(epoch_valid['detection_dict'])
 
             #Compute validation loss average for this epoch, and see if it is better than best validation loss, if so save the checkpoint
@@ -358,11 +358,11 @@ class ModelTrainer(nn.Module):
                 self.saveCheckpoint(epoch,valid_loss=valid_loss_avg,localization_dict_avg=valid_localization_dict_avg,detection_dict_avg=valid_detection_dict_avg)
 
             #Compute the average of training localization and detection dicts
-            train_localization_dict_avg=utils.average_localization_dict_overbatches(epoch_train['localization_dict'])
+            train_localization_dict_avg=utils.average_localization_dict_serialized(epoch_train['localization_dict'])
             train_detection_dict_avg=utils.average_detection_dict_overbatches(epoch_train['detection_dict'])
 
             #Update the progress bar:
-            pbar.set_postfix_str('Train Err: EucDist= %.4f (mm), P= %.4f, R= %.4f, F1= %.4f; Valid Err: EucDist= %.4f (mm), P= %.4f, R= %.4f, F1= %.4f'
+            pbar.set_postfix_str('Tr Er: EuDis=%.4f (mm), P=%.4f, R=%.4f, F1=%.4f; Val Er: EuDist=%.4f (mm), P=%.4f, R=%.4f, F1=%.4f'
                                   % (train_localization_dict_avg['euc_dist_mm_avg'],train_detection_dict_avg['overall']['precision'],train_detection_dict_avg['overall']['recall'],train_detection_dict_avg['overall']['f1'],
                                      valid_localization_dict_avg['euc_dist_mm_avg'],valid_detection_dict_avg['overall']['precision'],valid_detection_dict_avg['overall']['recall'],valid_detection_dict_avg['overall']['f1']))
 

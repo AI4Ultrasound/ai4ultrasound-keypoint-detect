@@ -116,7 +116,7 @@ def modelTester(model,test_loader,return_mode,matching_strategy,loss_fun,device,
                                     % (test_logger['localization_dict'][-1]['euc_dist_mm_avg'],test_logger['detection_dict'][-1]['overall']['precision'],test_logger['detection_dict'][-1]['overall']['recall'],test_logger['detection_dict'][-1]['overall']['f1']))
 
     #Computing average results
-    avg_localization = utils.average_localization_dict_overbatches(test_logger['localization_dict'])
+    avg_localization = utils.average_localization_dict_serialized(test_logger['localization_dict'])
     avg_detection    = utils.average_detection_dict_overbatches(test_logger['detection_dict'])
     avg_loss         = float(np.mean(test_logger['loss'])) if test_logger['loss'] else float('nan')
     
@@ -128,7 +128,7 @@ def modelTester(model,test_loader,return_mode,matching_strategy,loss_fun,device,
     }
 
     #Saving the testing results
-    save_dir=os.path.join('stats','test_results')
+    save_dir=os.path.join('../stats','test_results')
     os.makedirs(save_dir,exist_ok=True)
     save_path=os.path.join(save_dir,model_name_save+'.pt')
     #Make sure the path doesn't exist

@@ -57,7 +57,7 @@ if __name__=='__main__':
         'return_mode': 'frame',
 
         #Batch size and num epochs
-        'batch_size': 8,
+        'batch_size': 32,
         'num_epochs': 100,
 
         #Learning rate and scheduler
@@ -66,9 +66,10 @@ if __name__=='__main__':
 
         #Model Parameters
         'return_mode': 'frame',
+        'heatmap_head_dropout': 0.2,
         'model_type': 'pose_hrnet_w48_udp',
-        'mmpose_config': None, #None: mim downloads the model config into the mmpose_cache_dir automatically
-        'pretrained_backbone': None,
+        'mmpose_config': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192.py', #None: mim downloads the model config into the mmpose_cache_dir automatically
+        'pretrained_backbone': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192-3feaef8f_20220913.pth',
         'mmpose_cache_dir': '../mmpose_model_cache',
 
         #Loss Function Parameters
@@ -174,7 +175,8 @@ if __name__=='__main__':
         in_channels=in_channels,
         mmpose_config=hyperparameters['mmpose_config'],
         pretrained_backbone=hyperparameters['pretrained_backbone'],
-        mmpose_cache_dir=hyperparameters['mmpose_cache_dir']
+        mmpose_cache_dir=hyperparameters['mmpose_cache_dir'],
+        heatmap_head_dropout=hyperparameters['heatmap_head_dropout']
     ).to(device=device)
 
 
@@ -195,7 +197,7 @@ if __name__=='__main__':
         LR_scheduler=torch.optim.lr_scheduler.OneCycleLR(
                     optimizer,
                     max_lr=hyperparameters['learning_rate'],
-                    steps_per_epoch=len(train_loader)/hyperparameters['batch_size'],
+                    steps_per_epoch=len(train_loader),
                     epochs=hyperparameters['num_epochs'],
                     pct_start=0.3,
                     div_factor=25,
@@ -236,7 +238,7 @@ if __name__=='__main__':
         us_framesize=hyperparameters['us_framesize'],
         LR_scheduler=LR_scheduler,
         return_mode=hyperparameters['return_mode'],
-        checkpoint_savedir='models',
+        checkpoint_savedir='../models',
         model_name_save=model_name_save,
         model_name_load=model_name_load,
         start_from_checkpoint=False,
@@ -252,10 +254,10 @@ if __name__=='__main__':
     #Load best model and run tester
     checkpoint_path=os.path.join('../models',model_name_load+'.pt')
     if os.path.exists(checkpoint_path):
-        checkpoint_model=torch.load(checkpoint_path) #Use best model on validation set for testing
+        checkpoint_model=torch.load(checkpoint_path,map_location=device, weights_only=False) #Use best model on validation set for testing
         model.load_state_dict(checkpoint_model['model_state_dict'])
         model=model.to(device)
-        test_loader=DataLoader(dataset=test_data,batch_size=hyperparameters['batch_size_test'],shuffle=False,num_workers=0,collate_fn=utils.frame_collate_fn)
+        test_loader=DataLoader(dataset=test_data,batch_size=hyperparameters['batch_size_test'],shuffle=False,num_workers=0,collate_fn=utils.frame_collate_fn,pin_memory=True)
         test_results=ModelTester.modelTester(
             model=model,
             test_loader=test_loader,
@@ -280,15 +282,13 @@ if __name__=='__main__':
 
     #Compute stats
     stats_dir_name='../stats'
-    if not os.path.isdir(stats_dir_name):
-        os.mkdir(stats_dir_name)
+    os.makedirs(stats_dir_name, exist_ok=True)
     stats_save_file=os.path.join(stats_dir_name, model_name_save + '_stats.json')
     utils.computeStats(test_logger=test_results,train_logger=train_logger,valid_logger=valid_logger,save_file=stats_save_file)
 
     #Plotting results
     plot_dir_name=os.path.join('../figs', model_name_save)
-    if not os.path.isdir(plot_dir_name):
-        os.mkdir(plot_dir_name)
+    os.makedirs(plot_dir_name, exist_ok=True)
 
     utils.plotTrainingLoss(train_logger=train_logger,valid_logger=valid_logger,save_file=os.path.join(plot_dir_name,'loss_train.svg'))
     utils.plotLocalizationMetrics(train_logger=train_logger,valid_logger=valid_logger,save_file=os.path.join(plot_dir_name,'localization_trainvalid.svg'))
