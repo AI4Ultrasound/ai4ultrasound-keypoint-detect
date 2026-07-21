@@ -1873,7 +1873,7 @@ def plotTrainingLoss(train_logger, valid_logger=None, save_file=None):
     if valid_means is not None and len(valid_means) >= w:
         sm_valid = _rolling(valid_means, w)
         axes[1].plot(v_epochs, valid_means, color='orangered', linewidth=0.8, alpha=0.4)
-        axes[1].plot(sm_ep, sm_valid, color='orangered', linewidth=2.5,
+        axes[1].plot(v_epochs, sm_valid, color='orangered', linewidth=2.5,
                      label=f'Valid ({w}-ep smooth)')
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Loss')

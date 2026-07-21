@@ -68,8 +68,8 @@ if __name__=='__main__':
         'return_mode': 'frame',
         'heatmap_head_dropout': 0.2,
         'model_type': 'pose_hrnet_w48_udp',
-        'mmpose_config': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192.py', #None: mim downloads the model config into the mmpose_cache_dir automatically
-        'pretrained_backbone': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192-3feaef8f_20220913.pth',
+        'mmpose_config': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192.py', #Set to None on first run: mim downloads the model config into the mmpose_cache_dir automatically
+        'pretrained_backbone': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192-3feaef8f_20220913.pth', #Set to None on first run
         'mmpose_cache_dir': '../mmpose_model_cache',
 
         #Loss Function Parameters
@@ -150,13 +150,13 @@ if __name__=='__main__':
     device = torch.device(0 if torch.cuda.is_available() else 'cpu')
     print('using device: '+str(device))
 
-    #Cast the stats of the dataset objects to tensors and GPU for unnormalization
-    train_data.cast_stat_dicts_to_tensor_and_device(device)
-    valid_data.cast_stat_dicts_to_tensor_and_device(device)
+    # #Cast the stats of the dataset objects to tensors and GPU for unnormalization
+    # train_data.cast_stat_dicts_to_tensor_and_device(device)
+    # valid_data.cast_stat_dicts_to_tensor_and_device(device)
 
-    ######################Setup Dataloader##################
-    train_loader=DataLoader(dataset=train_data,batch_size=hyperparameters['batch_size'],shuffle=True,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn) #num_workers=0 works fastest
-    valid_loader=DataLoader(dataset=valid_data,batch_size=hyperparameters['batch_size'],shuffle=False,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn)
+    # ######################Setup Dataloader##################
+    # train_loader=DataLoader(dataset=train_data,batch_size=hyperparameters['batch_size'],shuffle=True,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn) #num_workers=0 works fastest
+    # valid_loader=DataLoader(dataset=valid_data,batch_size=hyperparameters['batch_size'],shuffle=False,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn)
 
     ##################Initialize model, optimizer and lr scheduler########
     #####Create model
@@ -180,37 +180,37 @@ if __name__=='__main__':
     ).to(device=device)
 
 
-    #####Initializes the optimizer with the specified learning rate
-    optimizer = optim.Adam(model.parameters(), lr=hyperparameters['learning_rate'])
+    # #####Initializes the optimizer with the specified learning rate
+    # optimizer = optim.Adam(model.parameters(), lr=hyperparameters['learning_rate'])
 
-    #####See how many parameters model has:
-    num_model_params = 0
-    for param in model.parameters():
-        num_model_params += param.flatten().shape[0]
+    # #####See how many parameters model has:
+    # num_model_params = 0
+    # for param in model.parameters():
+    #     num_model_params += param.flatten().shape[0]
 
-    print("-This Model Has %d (Approximately %d Million) Parameters!" % (num_model_params, num_model_params//1e6))
-    print("-------------------")
+    # print("-This Model Has %d (Approximately %d Million) Parameters!" % (num_model_params, num_model_params//1e6))
+    # print("-------------------")
 
 
-    ####Setup learning rate scheduler if we are using one
-    if hyperparameters['lr_scheduler_name']=='OneCycleLR':            
-        LR_scheduler=torch.optim.lr_scheduler.OneCycleLR(
-                    optimizer,
-                    max_lr=hyperparameters['learning_rate'],
-                    steps_per_epoch=len(train_loader),
-                    epochs=hyperparameters['num_epochs'],
-                    pct_start=0.3,
-                    div_factor=25,
-                )
-    elif hyperparameters['lr_scheduler_name']=='ReduceLROnPlateau':            
-        LR_scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6,
-                )
-    elif hyperparameters['lr_scheduler_name']=='CosineAnnealingLR':
-        LR_scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=hyperparameters['num_epochs'], eta_min=1e-6)
-    else:
-        LR_scheduler=None
+    # ####Setup learning rate scheduler if we are using one
+    # if hyperparameters['lr_scheduler_name']=='OneCycleLR':            
+    #     LR_scheduler=torch.optim.lr_scheduler.OneCycleLR(
+    #                 optimizer,
+    #                 max_lr=hyperparameters['learning_rate'],
+    #                 steps_per_epoch=len(train_loader),
+    #                 epochs=hyperparameters['num_epochs'],
+    #                 pct_start=0.3,
+    #                 div_factor=25,
+    #             )
+    # elif hyperparameters['lr_scheduler_name']=='ReduceLROnPlateau':            
+    #     LR_scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(
+    #                 optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6,
+    #             )
+    # elif hyperparameters['lr_scheduler_name']=='CosineAnnealingLR':
+    #     LR_scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(
+    #                 optimizer, T_max=hyperparameters['num_epochs'], eta_min=1e-6)
+    # else:
+    #     LR_scheduler=None
 
     
     ###################Loss Function##################
@@ -226,29 +226,29 @@ if __name__=='__main__':
     
 
     ##################Model Training##################
-    train_obj=ModelTrainer(
-        model=model,
-        loss_fun=loss_fun,
-        optimizer=optimizer,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        num_epochs=hyperparameters['num_epochs'],
-        device=device,
-        loss_type=hyperparameters['loss_type'],
-        us_framesize=hyperparameters['us_framesize'],
-        LR_scheduler=LR_scheduler,
-        return_mode=hyperparameters['return_mode'],
-        checkpoint_savedir='../models',
-        model_name_save=model_name_save,
-        model_name_load=model_name_load,
-        start_from_checkpoint=False,
-        matching_strategy=hyperparameters['matching_strategy'],
-        match_thresh_percentage=hyperparameters['match_thresh_percentage'],
-        verbose=False,
-        metric_every_n_batches=hyperparameters['metric_every_n_batches'])
+    # train_obj=ModelTrainer(
+    #     model=model,
+    #     loss_fun=loss_fun,
+    #     optimizer=optimizer,
+    #     train_loader=train_loader,
+    #     valid_loader=valid_loader,
+    #     num_epochs=hyperparameters['num_epochs'],
+    #     device=device,
+    #     loss_type=hyperparameters['loss_type'],
+    #     us_framesize=hyperparameters['us_framesize'],
+    #     LR_scheduler=LR_scheduler,
+    #     return_mode=hyperparameters['return_mode'],
+    #     checkpoint_savedir='../models',
+    #     model_name_save=model_name_save,
+    #     model_name_load=model_name_load,
+    #     start_from_checkpoint=False,
+    #     matching_strategy=hyperparameters['matching_strategy'],
+    #     match_thresh_percentage=hyperparameters['match_thresh_percentage'],
+    #     verbose=False,
+    #     metric_every_n_batches=hyperparameters['metric_every_n_batches'])
     
-    #Run training
-    train_obj.train()
+    # #Run training
+    # train_obj.train()
 
     ##################Model Testing###################
     #Load best model and run tester
@@ -297,15 +297,16 @@ if __name__=='__main__':
     
     
     
-    if os.path.exists(checkpoint_path):
+    if test_results is not None:
         utils.plotTestBoxplots(test_logger=test_results,save_file=os.path.join(plot_dir_name,'boxplot_test.svg'))
         utils.plotPerCategoryMetrics_Test(test_logger=test_results,save_file=os.path.join(plot_dir_name,'percategory_test.svg'))
         utils.plotTestErrorHistogram(test_logger=test_results,save_file=os.path.join(plot_dir_name,'localizationhist_test.svg'))
-
+    else:
+        print('test_results unavailable — skipping test plots.')
     
     #Cleanup memory
     del train_data,valid_data,test_data
-    del train_loader,valid_loader
-    del optimizer,LR_scheduler,loss_fun,train_obj
+    # del train_loader,valid_loader
+    # del optimizer,LR_scheduler,loss_fun,train_obj
     del model
     torch.cuda.empty_cache()
