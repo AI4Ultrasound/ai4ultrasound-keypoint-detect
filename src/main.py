@@ -24,8 +24,8 @@ if __name__=='__main__':
     for annotator_name in annotator_names:
         hyperparameters={
             #Name of saved/load model (change each of these on every re-run)
-            'base_model_name_save': 'model_July21_HRNetUDP_'+annotator_name,
-            'base_model_name_load': 'model_July21_HRNetUDP_'+annotator_name,
+            'base_model_name_save': 'model_July21_HRNetUDP_'+annotator_name+'_Lahey',
+            'base_model_name_load': 'model_July21_HRNetUDP_'+annotator_name+'_Lahey',
             #Datasplitter params
             'dataset_root': '../../../Data/Keypoint_Detect_Data',
             'train_split': 0.7,
@@ -35,7 +35,7 @@ if __name__=='__main__':
             'equal_prop_tags': ['site','annotator'],
             'metadata_tags': 
             {
-                'site': ['All'],
+                'site': ['Lahey'],
                 'annotator': [annotator_name],
                 'zone_label': ['All'],
                 'patient_id': ['All'],
@@ -60,7 +60,7 @@ if __name__=='__main__':
 
             #Batch size and num epochs
             'batch_size': 32,
-            'num_epochs': 4,
+            'num_epochs': 100,
 
             #Learning rate and scheduler
             'learning_rate': 0.01, #Used as maximum learning rate in OneCycleLR case
@@ -68,7 +68,7 @@ if __name__=='__main__':
 
             #Model Parameters
             'return_mode': 'frame',
-            'heatmap_head_dropout': 0.3,
+            'heatmap_head_dropout': 0.25,
             'model_type': 'pose_hrnet_w48_udp',
             'mmpose_config': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192.py', #Set to None on first run: mim downloads the model config into the mmpose_cache_dir automatically
             'pretrained_backbone': '../mmpose_model_cache/td-hm_hrnet-w48_udp-8xb32-210e_coco-256x192-3feaef8f_20220913.pth', #Set to None on first run
