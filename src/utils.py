@@ -1412,6 +1412,10 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
             # Fraction of frames where the model predicted exactly the right
             # number of keypoints for this category
             'count_exact_acc':  float(np.mean([e == 0 for e in count_errors_c])),
+            #Add the raw totals for per-frame aggregation
+            'count_error_sum':  float(np.sum(count_errors_c)),
+            'count_exact_sum':  float(sum(e == 0 for e in count_errors_c)),
+            'n_frames':         len(count_errors_c),
             'tp': tp_c,
             'fp': fp_c,
             'fn': fn_c,
@@ -1436,6 +1440,10 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
             'count_error_mean': float(np.mean(overall_count_errors)),
             'count_error_std':  float(np.std(overall_count_errors)),
             'count_exact_acc':  float(np.mean([e == 0 for e in overall_count_errors])),
+            #Raw totals for per-frame aggregation
+            'count_error_sum':  float(np.sum(overall_count_errors)),
+            'count_exact_sum':  float(sum(e == 0 for e in overall_count_errors)),
+            'n_frames':         len(overall_count_errors),
             'tp': all_tp,
             'fp': all_fp,
             'fn': all_fn,
@@ -1506,6 +1514,17 @@ def average_localization_dict_serialized(localization_dict_list):
             result[key] = float(np.nanmean(np.array([float(v) for v in vals], dtype=np.float64)))
     return result
 
+def _true_per_frame(dicts_subset):
+        """Pool count_error_sum/count_exact_sum/n_frames across all batches,
+        then divide once — gives true per-frame mean rather than mean of batch means."""
+        total_err_sum   = sum(d.get('count_error_sum', 0.0) for d in dicts_subset)
+        total_exact_sum = sum(d.get('count_exact_sum', 0.0) for d in dicts_subset)
+        total_n         = sum(d.get('n_frames',        0)   for d in dicts_subset)
+        return (
+            total_err_sum   / total_n if total_n > 0 else float('nan'),  # true count_error_mean
+            total_exact_sum / total_n if total_n > 0 else float('nan'),  # true count_exact_acc
+        )
+
 def average_detection_dict_overbatches(detect_dict_list):
     """
     Aggregates detection metrics across batches.
@@ -1527,21 +1546,75 @@ def average_detection_dict_overbatches(detect_dict_list):
     if not detect_dict_list:
         return {}
 
-    # Discover which categories exist from the first dict
-    cat_names = list(detect_dict_list[0]['per_category'].keys())
-        # ── Per-category aggregation ───────────────────────────────────────────
-    per_category_avg = {}
-    for cat_name in cat_names:
-        bucket_dicts = [d['per_category'][cat_name] for d in detect_dict_list] #Get list of dicts for per-category results for this category
-        per_category_avg[cat_name] = _aggregate_bucket(bucket_dicts)
+    # ── Overall ──────────────────────────────────────────────────────────────
+    overall_dicts = [d['overall'] for d in detect_dict_list if 'overall' in d]
 
-    # ── Overall aggregation ────────────────────────────────────────────────
-    overall_avg = _aggregate_bucket([d['overall'] for d in detect_dict_list])
+    all_tp = sum(d.get('tp', 0) for d in overall_dicts)
+    all_fp = sum(d.get('fp', 0) for d in overall_dicts)
+    all_fn = sum(d.get('fn', 0) for d in overall_dicts)
 
-    return {
-        'per_category': per_category_avg,
-        'overall':      overall_avg,
+    overall_prec = all_tp / (all_tp + all_fp) if (all_tp + all_fp) > 0 else float('nan')
+    overall_rec  = all_tp / (all_tp + all_fn) if (all_tp + all_fn) > 0 else float('nan')
+    overall_f1   = (2 * overall_prec * overall_rec / (overall_prec + overall_rec)
+                    if not any(np.isnan([overall_prec, overall_rec]))
+                       and (overall_prec + overall_rec) > 0
+                    else float('nan'))
+
+    # ↓ true per-frame values using pooled sums
+    count_err_mean, count_exact_acc = _true_per_frame(overall_dicts)
+
+    averaged = {
+        'overall': {
+            'precision':        overall_prec,
+            'recall':           overall_rec,
+            'f1':               overall_f1,
+            'count_error_mean': count_err_mean,    # ← now true per-frame
+            'count_exact_acc':  count_exact_acc,   # ← now true per-frame
+            'tp': all_tp,
+            'fp': all_fp,
+            'fn': all_fn,
+        },
+        'per_category': {}
     }
+
+    # ── Per-category ─────────────────────────────────────────────────────────
+    all_cat_names = {
+        cat
+        for d in detect_dict_list
+        for cat in d.get('per_category', {})
+    }
+
+    for cat in all_cat_names:
+        cat_dicts = [
+            d['per_category'][cat]
+            for d in detect_dict_list
+            if cat in d.get('per_category', {})
+        ]
+        tp_c = sum(d.get('tp', 0) for d in cat_dicts)
+        fp_c = sum(d.get('fp', 0) for d in cat_dicts)
+        fn_c = sum(d.get('fn', 0) for d in cat_dicts)
+
+        prec = tp_c / (tp_c + fp_c) if (tp_c + fp_c) > 0 else float('nan')
+        rec  = tp_c / (tp_c + fn_c) if (tp_c + fn_c) > 0 else float('nan')
+        f1   = (2 * prec * rec / (prec + rec)
+                if not any(np.isnan([prec, rec])) and (prec + rec) > 0
+                else float('nan'))
+
+        # ↓ true per-frame values using pooled sums
+        count_err_mean_c, count_exact_acc_c = _true_per_frame(cat_dicts)
+
+        averaged['per_category'][cat] = {
+            'precision':        prec,
+            'recall':           rec,
+            'f1':               f1,
+            'count_error_mean': count_err_mean_c,  
+            'count_exact_acc':  count_exact_acc_c, 
+            'tp': tp_c,
+            'fp': fp_c,
+            'fn': fn_c,
+        }
+
+    return averaged
 
 
 #Helpers for computing gaverages of the detection dict:
@@ -1683,54 +1756,6 @@ def computeStats(test_logger, train_logger=None, valid_logger=None, save_file=No
     Test logger            → flat per-batch, micro-averaged here.
     """
     results = {}
-
-    # ── Test ─────────────────────────────────────────────────────────────────
-    if test_logger and test_logger.get('loss'):
-        loc_avg = average_localization_dict_serialized(test_logger['localization_dict'])
-        det_avg = average_detection_dict_overbatches(test_logger['detection_dict'])
-        pa = loc_avg.get('peraxis_mm_err_avg', [float('nan'), float('nan')])
-
-        results['test'] = {
-            'loss_mean':               float(np.nanmean(test_logger['loss'])),
-            'loss_std':                float(np.nanstd(test_logger['loss'])),
-            'euc_dist_mm_mean':        loc_avg.get('euc_dist_mm_avg',  float('nan')),
-            'euc_dist_mm_std':         loc_avg.get('euc_dist_mm_std',  float('nan')),
-            'euc_dist_px_mean':        loc_avg.get('euc_dist_px_avg',  float('nan')),
-            'peraxis_mm_x_mean':       float(pa[0]) if isinstance(pa, (list,tuple)) else float('nan'),
-            'peraxis_mm_y_mean':       float(pa[1]) if isinstance(pa, (list,tuple)) and len(pa)>1 else float('nan'),
-            'perc_err_mean':           loc_avg.get('perc_err', float('nan')),
-            'overall_precision':       det_avg.get('overall',{}).get('precision',        float('nan')),
-            'overall_recall':          det_avg.get('overall',{}).get('recall',           float('nan')),
-            'overall_f1':              det_avg.get('overall',{}).get('f1',               float('nan')),
-            'overall_count_err_mean':  det_avg.get('overall',{}).get('count_error_mean', float('nan')),
-            'overall_count_exact_acc': det_avg.get('overall',{}).get('count_exact_acc',  float('nan')),
-        }
-        for cat, cd in det_avg.get('per_category', {}).items():
-            results['test'][f'{cat}_precision'] = cd.get('precision', float('nan'))
-            results['test'][f'{cat}_recall']    = cd.get('recall',    float('nan'))
-            results['test'][f'{cat}_f1']        = cd.get('f1',        float('nan'))
-            results['test'][f'{cat}_count_err'] = cd.get('count_error_mean', float('nan'))
-
-        r = results['test']
-        print("="*60)
-        print("TEST RESULTS:")
-        print(f"  Loss                        : {r['loss_mean']:.4f} ± {r['loss_std']:.4f}")
-        print(f"  Euclidean Distance (mm)     : {r['euc_dist_mm_mean']:.4f} ± {r['euc_dist_mm_std']:.4f}")
-        print(f"  Euclidean Distance (px)     : {r['euc_dist_px_mean']:.4f}")
-        print(f"  Per-axis Error:       X (mm): {r['peraxis_mm_x_mean']:.4f}, Y (mm): {r['peraxis_mm_y_mean']:.4f}")
-        print(f"  Percentage Error            : {r['perc_err_mean']:.2f} %")
-        print(f"  Overall Precision           : {r['overall_precision']:.4f}")
-        print(f"  Overall Recall              : {r['overall_recall']:.4f}")
-        print(f"  Overall F1                  : {r['overall_f1']:.4f}")
-        print(f"  Count Error Mean            : {r['overall_count_err_mean']:.4f}")
-        print(f"  Count Exact Accuracy        : {r['overall_count_exact_acc']:.4f}")
-        for cat in det_avg.get('per_category', {}):
-            print(f"  [{cat:<10s}]: "
-                  f"P={r[f'{cat}_precision']:.4f}, "
-                  f"R={r[f'{cat}_recall']:.4f}, "
-                  f"F1={r[f'{cat}_f1']:.4f}, "
-                  f"CountErr={r[f'{cat}_count_err']:.3f}")
-
     # ── Train / Valid  — already per-epoch averages, read directly ───────────
     for split, logger in [('train', train_logger), ('valid', valid_logger)]:
         if logger is None or not logger.get('loss'):
@@ -1785,6 +1810,62 @@ def computeStats(test_logger, train_logger=None, valid_logger=None, save_file=No
         print(f"  Final Euclidean Dist (mm)   : {r['final_euc_dist_mm']:.4f}")
         print(f"  Final Precision; Recall; F1 : "
               f"{r['final_precision']:.4f}; {r['final_recall']:.4f}; {r['final_f1']:.4f}")
+
+
+    # ── Test ─────────────────────────────────────────────────────────────────
+    if test_logger is not None:
+        loc_avg = test_logger['avg_localization']
+        det_avg = test_logger['avg_detection']
+        avg_loss=test_logger['avg_loss']
+
+        #STD still needs the raw per-batch losses
+        raw_losses=test_logger['raw_logger']['loss']
+        loss_std=float(np.nanstd(raw_losses)) if raw_losses else float('nan')
+
+        #Per axis error
+        pa = loc_avg.get('peraxis_mm_err_avg', [float('nan'), float('nan')])
+
+        results['test'] = {
+            'loss_mean':               avg_loss,
+            'loss_std':                loss_std,
+            'euc_dist_mm_mean':        loc_avg.get('euc_dist_mm_avg',  float('nan')),
+            'euc_dist_mm_std':         loc_avg.get('euc_dist_mm_std',  float('nan')),
+            'euc_dist_px_mean':        loc_avg.get('euc_dist_px_avg',  float('nan')),
+            'peraxis_mm_x_mean':       float(pa[0]) if isinstance(pa, (list,tuple)) else float('nan'),
+            'peraxis_mm_y_mean':       float(pa[1]) if isinstance(pa, (list,tuple)) and len(pa)>1 else float('nan'),
+            'perc_err_mean':           loc_avg.get('perc_err', float('nan')),
+            'overall_precision':       det_avg.get('overall',{}).get('precision',        float('nan')),
+            'overall_recall':          det_avg.get('overall',{}).get('recall',           float('nan')),
+            'overall_f1':              det_avg.get('overall',{}).get('f1',               float('nan')),
+            'overall_count_err_mean':  det_avg.get('overall',{}).get('count_error_mean', float('nan')),
+            'overall_count_exact_acc': det_avg.get('overall',{}).get('count_exact_acc',  float('nan')),
+        }
+        for cat, cd in det_avg.get('per_category', {}).items():
+            results['test'][f'{cat}_precision'] = cd.get('precision', float('nan'))
+            results['test'][f'{cat}_recall']    = cd.get('recall',    float('nan'))
+            results['test'][f'{cat}_f1']        = cd.get('f1',        float('nan'))
+            results['test'][f'{cat}_count_err'] = cd.get('count_error_mean', float('nan'))
+
+        r = results['test']
+        print("="*60)
+        print("TEST RESULTS:")
+        print(f"  Loss                        : {r['loss_mean']:.4f} ± {r['loss_std']:.4f}")
+        print(f"  Euclidean Distance (mm)     : {r['euc_dist_mm_mean']:.4f} ± {r['euc_dist_mm_std']:.4f}")
+        print(f"  Euclidean Distance (px)     : {r['euc_dist_px_mean']:.4f}")
+        print(f"  Per-axis Error:       X (mm): {r['peraxis_mm_x_mean']:.4f}, Y (mm): {r['peraxis_mm_y_mean']:.4f}")
+        print(f"  Percentage Error            : {r['perc_err_mean']:.2f} %")
+        print(f"  Overall Precision           : {r['overall_precision']:.4f}")
+        print(f"  Overall Recall              : {r['overall_recall']:.4f}")
+        print(f"  Overall F1                  : {r['overall_f1']:.4f}")
+        print(f"  Count Error Mean            : {r['overall_count_err_mean']:.4f}")
+        print(f"  Count Exact Accuracy        : {r['overall_count_exact_acc']:.4f}")
+        for cat in det_avg.get('per_category', {}):
+            print(f"  [{cat:<10s}]: "
+                  f"P={r[f'{cat}_precision']:.4f}, "
+                  f"R={r[f'{cat}_recall']:.4f}, "
+                  f"F1={r[f'{cat}_f1']:.4f}, "
+                  f"CountErr={r[f'{cat}_count_err']:.3f}")
+            
 
     if save_file:
         os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
@@ -2042,6 +2123,7 @@ def plotTestBoxplots(test_logger, save_file=None):
     def _clean(lst):
         return [v for v in lst if not np.isnan(float(v))]
 
+    print("Passed checks in plotTestBoxplots")
     # ── Localization data ────────────────────────────────────────────────────
     euc_mm  = [d.get('euc_dist_mm_avg', np.nan) for d in loc_dicts]
     axis_x  = [_pa(d, 0) for d in loc_dicts]
@@ -2075,7 +2157,8 @@ def plotTestBoxplots(test_logger, save_file=None):
 
     # Left: localization
     bp_loc = axes[0].boxplot([_clean(d) for d in loc_data],
-                              labels=loc_labels, patch_artist=True)
+                              patch_artist=True)
+    axes[0].set_xticklabels(loc_labels,fontsize=8)
     loc_box_colors = cm.Blues(np.linspace(0.35, 0.75, len(loc_data)))
     for patch, fc in zip(bp_loc['boxes'], loc_box_colors):
         patch.set_facecolor(fc)
@@ -2085,7 +2168,8 @@ def plotTestBoxplots(test_logger, save_file=None):
 
     # Right: detection
     bp_det = axes[1].boxplot([_clean(d) for d in det_data],
-                              labels=det_labels, patch_artist=True)
+                              patch_artist=True)
+    axes[1].set_xticklabels(det_labels,fontsize=8)
     for patch, fc in zip(bp_det['boxes'], det_colors):
         patch.set_facecolor(fc)
         patch.set_alpha(0.75)
@@ -2093,7 +2177,6 @@ def plotTestBoxplots(test_logger, save_file=None):
     axes[1].set_ylabel('Score')
     axes[1].set_ylim(-0.05, 1.1)
     axes[1].grid(True, alpha=0.3, axis='y')
-    plt.setp(axes[1].get_xticklabels(), fontsize=8)
 
     plt.tight_layout()
     _safe_save(fig, save_file)
