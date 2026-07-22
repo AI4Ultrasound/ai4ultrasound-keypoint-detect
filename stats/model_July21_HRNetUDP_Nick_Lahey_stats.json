@@ -1,0 +1,49 @@
+{
+  "train": {
+    "num_epochs": 100,
+    "best_epoch": 94,
+    "best_epoch_loss": 0.0032091592753155005,
+    "best_epoch_euc_dist_mm": 0.6632083505392075,
+    "best_epoch_precision": 1.0,
+    "best_epoch_recall": 0.9710280373831776,
+    "best_epoch_f1": 0.9853010905642485,
+    "final_loss": 0.003233455285127904,
+    "final_euc_dist_mm": 0.6211321155230204,
+    "final_precision": 1.0,
+    "final_recall": 0.9846743295019157,
+    "final_f1": 0.9922779922779923
+  },
+  "valid": {
+    "num_epochs": 100,
+    "best_epoch": 17,
+    "best_epoch_loss": 0.03505561292171478,
+    "best_epoch_euc_dist_mm": 3.824038739204407,
+    "best_epoch_precision": 0.8589263420724095,
+    "best_epoch_recall": 0.7730337078651686,
+    "best_epoch_f1": 0.8137196924896513,
+    "final_loss": 0.04167596407234669,
+    "final_euc_dist_mm": 8.464103944301606,
+    "final_precision": 0.9027911453320501,
+    "final_recall": 0.5269662921348315,
+    "final_f1": 0.6654842142603761
+  },
+  "test": {
+    "loss_mean": 0.044722312855952066,
+    "loss_std": 0.014728745063992032,
+    "euc_dist_mm_mean": 3.761603056824297,
+    "euc_dist_mm_std": 1.7437079300389702,
+    "euc_dist_px_mean": 14.23805419159563,
+    "peraxis_mm_x_mean": 3.4578762983618523,
+    "peraxis_mm_y_mean": 1.1269443367507523,
+    "perc_err_mean": 7.8654880232647,
+    "overall_precision": 0.7144450641383157,
+    "overall_recall": 0.7156424581005587,
+    "overall_f1": 0.7150432598381246,
+    "overall_count_err_mean": 0.6553884711779449,
+    "overall_count_exact_acc": 0.40977443609022557,
+    "pleural_precision": 0.7144450641383157,
+    "pleural_recall": 0.7156424581005587,
+    "pleural_f1": 0.7150432598381246,
+    "pleural_count_err": 0.6553884711779449
+  }
+}
