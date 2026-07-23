@@ -14,7 +14,7 @@ class ModelTrainer(nn.Module):
     def __init__(self,model,loss_fun,optimizer,train_loader,valid_loader,
                  num_epochs,device,loss_type,us_framesize,LR_scheduler=None,return_mode='frame',
                  checkpoint_savedir='models',model_name_save='model',model_name_load='model',start_from_checkpoint=False,
-                 matching_strategy='heatmap',match_thresh_percentage=0.1,verbose=False,metric_every_n_batches=5):
+                 matching_strategy='heatmap',match_thresh_percentage=0.1,verbose=False,metric_every_n_batches=5,line_type='pleuraline'):
         
         super(ModelTrainer,self).__init__()
         ##########Init Class Params#########
@@ -32,6 +32,7 @@ class ModelTrainer(nn.Module):
         self.H_in=us_framesize[0]
         self.W_in=us_framesize[1]
         self.us_framesize=us_framesize
+        self.line_type=line_type
         self.max_diagnoal=float(np.sqrt(self.H_in**2+self.W_in**2)) #Diagonal length
         #Match percentage is the percentage of the image size that below which we consider a predicted keypoint to be the same keypoint as a ground truth
         self.match_thresh_pixel=self.max_diagnoal*match_thresh_percentage
@@ -132,6 +133,8 @@ class ModelTrainer(nn.Module):
                     target_categories=data['categories'].to(self.device,non_blocking=True)  #(B,K)
                     px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul), size (B)
                     px_mul_y=data['px_mul_y']
+                    # print("Raw Image Shape: "+str(us_frames.shape))
+                    # print("Raw Target Keypoints Shape"+str(target_keypoints.shape))
 
                     #Gets prediction and runs the loss
                     if self.matching_strategy in ('fixed','hungarian'):
@@ -139,11 +142,14 @@ class ModelTrainer(nn.Module):
                         loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories,pred_categories=pred_categories)
                     elif self.matching_strategy=='heatmap':
                         pred_heatmaps=self.model(us_frames) #shape (B,2,H',W')
+                        # print("Pred Heatmaps Shape: "+str(pred_heatmaps.shape))
                         loss = self.loss_fun(
                         pred_heatmaps, target_keypoints,
                         target_visibility, target_areas, target_categories,
                         image_shape = (self.H_in,self.W_in),  
-                    )
+                        )
+                        loss_copy=loss.clone()
+                        print("Loss: "+str(loss_copy.item()))
 
                 elif self.return_mode=='clip': #Using the clip_collate_fn return where we pad the end of the time dimension with zeros
                     us_frames=data['images'].to(self.device,non_blocking=True) #(B,T, C, H, W)
@@ -217,18 +223,15 @@ class ModelTrainer(nn.Module):
 
                 ###########Compute Training Error and Log Loss+Error###########
                 if batch_idx % self.metric_every_n_batches==0: #Compute error for this batch
-                    unique_categories = torch.unique(target_categories)
-                    unique_categories = unique_categories[unique_categories >0]
-                    num_categories = unique_categories.numel()
 
                     if self.matching_strategy=='heatmap':
                         #Compute error on predicted heatmap using the utils compute error function
                         localization_dict,detection_dict=utils.calculateError(pred=pred_heatmaps,pred_categories=None,target_keypoints=target_keypoints,visibility=target_visibility,areas=target_areas,categories=target_categories,
-                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,num_categories=num_categories,image_shape=(self.H_in,self.W_in),
+                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,line_type=self.line_type,image_shape=(self.H_in,self.W_in),
                                                                             px_mul_x=px_mul_x,px_mul_y=px_mul_y,match_threshold=self.match_thresh_pixel,max_diagnoal=self.max_diagnoal)
                     else:
                         localization_dict,detection_dict=utils.calculateError(pred=pred_keypoints,pred_categories=pred_categories,target_keypoints=target_keypoints,visibility=target_visibility,areas=target_areas,categories=target_categories,
-                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,num_categories=num_categories,image_shape=(self.H_in,self.W_in),
+                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,line_type=self.line_type,image_shape=(self.H_in,self.W_in),
                                                                             px_mul_x=px_mul_x,px_mul_y=px_mul_y,match_threshold=self.match_thresh_pixel,max_diagnoal=self.max_diagnoal)
                     #Update the epoch train metrics accumulator
                     epoch_train['localization_dict'].append(utils._localization_dict_to_serializable(localization_dict))
@@ -316,18 +319,14 @@ class ModelTrainer(nn.Module):
                     if torch.isnan(loss):
                         continue
                     ###########Compute Validation Error and Log Loss+Error###########
-                    unique_categories = torch.unique(target_categories)
-                    unique_categories = unique_categories[unique_categories >0]
-                    num_categories = unique_categories.numel()
-
                     if self.matching_strategy=='heatmap':
                         #Compute error on predicted heatmap using the utils compute error function
                         localization_dict,detection_dict=utils.calculateError(pred=pred_heatmaps,pred_categories=None,target_keypoints=target_keypoints,visibility=target_visibility,areas=target_areas,categories=target_categories,
-                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,num_categories=num_categories,image_shape=(self.H_in,self.W_in),
+                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,line_type=self.line_type,image_shape=(self.H_in,self.W_in),
                                                                             px_mul_x=px_mul_x,px_mul_y=px_mul_y,match_threshold=self.match_thresh_pixel,max_diagnoal=self.max_diagnoal)
                     else:
                         localization_dict,detection_dict=utils.calculateError(pred=pred_keypoints,pred_categories=pred_categories,target_keypoints=target_keypoints,visibility=target_visibility,areas=target_areas,categories=target_categories,
-                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,num_categories=num_categories,image_shape=(self.H_in,self.W_in),
+                                                                            return_mode=self.return_mode,matching_strategy=self.matching_strategy,line_type=self.line_type,image_shape=(self.H_in,self.W_in),
                                                                             px_mul_x=px_mul_x,px_mul_y=px_mul_y,match_threshold=self.match_thresh_pixel,max_diagnoal=self.max_diagnoal)
                     
                     

@@ -20,6 +20,11 @@ from scipy.optimize import linear_sum_assignment
 CLASS_ID_PLEURAL_LINE=1
 CLASS_ID_B_LINE=2
 CATEGORY_NAMES = {CLASS_ID_PLEURAL_LINE: 'pleural', CLASS_ID_B_LINE: 'bline'}
+LINE_TYPE_TO_IDS = {
+    'pleuraline': [CLASS_ID_PLEURAL_LINE],
+    'bline':      [CLASS_ID_B_LINE],
+    'both':       [CLASS_ID_PLEURAL_LINE, CLASS_ID_B_LINE],
+}
 
 #These are data keys that are needed for processing
 REQUIRED_SCAN_KEYS = (
@@ -993,14 +998,16 @@ def apply_hungarian_matching( pred, pred_cats_logits, target, visibility, areas,
     return matched_pred, matched_tgt, matched_vis, matched_areas, matched_cats
 
 #Keypoint Heatmap Handling Functions
-def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, W_in,num_categories,heatmap_sigma):
+def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, W_in,line_type,heatmap_sigma):
     """
+    !!!!!line_type must the same one passed to decode_heatmaps!!!!!!
     Creates Gaussian heatmaps from target keypoint coordinates.
     keypoints  : (B, K, 2)  pixel coords in input image space (x, y)
     visibility : (B, K)   bool
     categories : (B, K)   long  1=pleural  2=bline  -1=padded
     H_out/W_out : heatmap spatial dimensions
     H_in/W_in   : input image spatial dimensions  (for coordinate scaling)
+    line_type: 'bline','pleuraline',or 'both'
 
     Returns
     -------
@@ -1011,6 +1018,10 @@ def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, 
 
     B, K, _ = keypoints.shape
     device  = keypoints.device
+    #Get the category id list, and num_categories
+    category_ids=LINE_TYPE_TO_IDS[line_type]
+    num_categories=len(category_ids)
+
     scale_x = W_out / W_in
     scale_y = H_out / H_in
 
@@ -1027,11 +1038,14 @@ def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, 
                                 dtype=torch.float32, device=device)
     
     vis_mask = visibility.bool() & (categories > 0)
+    print("vis_mask: "+str(vis_mask[0,:]))
 
-    for cat in range(num_categories):
+    for cat_idx,cat_tag in enumerate(category_ids):
         # Boolean mask for keypoints belonging to this category: (B, K)
-        cat_mask = vis_mask & (categories == (cat + 1))
+        cat_mask = vis_mask & (categories == cat_tag)
+        print("cat_mask: "+str(cat_mask[0,:]))
         if not cat_mask.any():
+            print("No cat_mask are true")
             continue
 
         # Broadcast: cx/cy (B,K,1,1) vs grid (1,1,H,W) → Gaussian (B,K,H,W)
@@ -1043,16 +1057,17 @@ def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, 
 
         # Zero out keypoints not in this category, then max-blend over K
         gauss = gauss * cat_mask[:, :, None, None].float()  # (B, K, H_out, W_out)
-        heatmaps[:, cat] = gauss.max(dim=1).values           # (B, H_out, W_out)
+        heatmaps[:, cat_idx] = gauss.max(dim=1).values           # (B, H_out, W_out)
 
         # Channel is active if any keypoint in that image belongs to this category
-        target_weight[:, cat] = cat_mask.any(dim=1).float()  # (B,)
+        target_weight[:, cat_idx] = cat_mask.any(dim=1).float()  # (B,)
 
     return heatmaps, target_weight
 
 def decode_heatmaps(heatmaps, H_in, W_in,
-                    detection_threshold=0.3, nms_kernel=5):
+                    detection_threshold=0.3, nms_kernel=5,line_type='pleuraline'):
     """
+    !!!!!line_type must the same one passed to make_target_heatmaps!!!!!!
     Converts spatial heatmaps to keypoint detections via NMS + subpixel refinement.
     heatmaps : (B, C, H', W')
     Returns three lists of length B:
@@ -1061,6 +1076,7 @@ def decode_heatmaps(heatmaps, H_in, W_in,
         - pred_scores_list — each (N_b,)   float  peak heatmap score
     """
     B, C, H_out, W_out = heatmaps.shape
+    category_ids=LINE_TYPE_TO_IDS[line_type] #Converts line_type to list of id intergers
     # Option A: simple consistent scaling (no +0.5)
     scale_x = W_in / W_out
     scale_y = H_in / H_out
@@ -1095,7 +1111,7 @@ def decode_heatmaps(heatmaps, H_in, W_in,
                 kps_b.append(
                     torch.tensor([[rx * scale_x, ry * scale_y]], dtype=torch.float32,device=heatmaps.device)
                 )
-                cats_b.append(torch.tensor([c + 1], dtype=torch.long,device=heatmaps.device))
+                cats_b.append(torch.tensor([category_ids[c]], dtype=torch.long,device=heatmaps.device))
                 scores_b.append(score)
 
 
@@ -1140,7 +1156,7 @@ def detect_one_image(pr_kps,gt_kps,threshold):
 #Error computation functions
 
 def calculateError(pred,pred_categories,target_keypoints,visibility,areas,categories,
-                   return_mode,matching_strategy,num_categories,image_shape,px_mul_x,px_mul_y,match_threshold,max_diagnoal):
+                   return_mode,matching_strategy,line_type,image_shape,px_mul_x,px_mul_y,match_threshold,max_diagnoal):
     """
     Input:
         - pred: output of model (either keypoints or heatmap). (B, K_pred, 2) when keypoints, (B, num_cat, H', W') when heatmap
@@ -1150,7 +1166,7 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
         - categories: (B, K)  long    1=pleural  2=bline  -1=padded (ground truth categories)
         - return_mode: 'clip' or 'frame'
         - matching_strategy: 'fixed','hungarian' or 'heatmap'. What is used by the loss function.
-        - num_categories: int. Number of categories we are predicting.
+        - line_type: 'bline','pleuraline',or 'both'
         - image_shape: tuple of image dimension 
         - match_threshold: maximum distance between keypoints to count as a true positive
     Return:
@@ -1229,7 +1245,7 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
     #Must get keypoints from the heatmap if model returns a heatmap
     if matching_strategy=='heatmap':
         #Convert predicted heatmap to keypoint coordinates        
-        pred_list,pred_categories_list,_=decode_heatmaps(pred, H_in, W_in,detection_threshold=0.3, nms_kernel=5)
+        pred_list,pred_categories_list,_=decode_heatmaps(pred, H_in, W_in,detection_threshold=0.3, nms_kernel=5,line_type=line_type)
 
         # Pad variable-length per-image detections into (B, K_max, 2) tensors
         K_max = max((p.shape[0] for p in pred_list), default=0)
@@ -1365,7 +1381,9 @@ def calculateError(pred,pred_categories,target_keypoints,visibility,areas,catego
     cat_results={}
     all_tp,all_fp,all_fn=0,0,0 #tp,fp,fn for this batch
 
-    for cat in range(1,num_categories+1): #Loops for each category starting at 1
+
+    category_ids = LINE_TYPE_TO_IDS[line_type]
+    for cat in category_ids: #Loops for each category
         tp_c,fp_c,fn_c=0,0,0 #results for this category
         count_errors_c=[] #
 

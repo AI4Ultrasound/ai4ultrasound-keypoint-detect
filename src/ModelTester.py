@@ -7,7 +7,7 @@ import json
 
 import utils
 
-def modelTester(model,test_loader,return_mode,matching_strategy,loss_fun,device,us_framesize,model_name_save,match_thresh_percentage=0.1):
+def modelTester(model,test_loader,return_mode,matching_strategy,loss_fun,device,us_framesize,model_name_save,match_thresh_percentage=0.1,line_type='pleuraline'):
     H_in=us_framesize[0]
     W_in=us_framesize[1]
     max_diagnoal=float(np.sqrt(H_in**2+W_in**2)) #Diagonal length
@@ -87,18 +87,15 @@ def modelTester(model,test_loader,return_mode,matching_strategy,loss_fun,device,
             if torch.isnan(loss):
                 continue
             ###########Compute Validation Error and Log Loss+Error###########
-            unique_categories = torch.unique(target_categories)
-            unique_categories = unique_categories[unique_categories >0]
-            num_categories = unique_categories.numel()
 
             if matching_strategy=='heatmap':
                 #Compute error on predicted heatmap using the utils compute error function
                 localization_dict,detection_dict=utils.calculateError(pred=pred_heatmaps,pred_categories=None,target_keypoints=target_keypoints,visibility=target_visibility,areas=target_areas,categories=target_categories,
-                                                                    return_mode=return_mode,matching_strategy=matching_strategy,num_categories=num_categories,image_shape=(H_in,W_in),
+                                                                    return_mode=return_mode,matching_strategy=matching_strategy,line_type=line_type,image_shape=(H_in,W_in),
                                                                     px_mul_x=px_mul_x,px_mul_y=px_mul_y,match_threshold=match_thresh_pixel,max_diagnoal=max_diagnoal)
             else:
                 localization_dict,detection_dict=utils.calculateError(pred=pred_keypoints,pred_categories=pred_categories,target_keypoints=target_keypoints,visibility=target_visibility,areas=target_areas,categories=target_categories,
-                                                                    return_mode=return_mode,matching_strategy=matching_strategy,num_categories=num_categories,image_shape=(H_in,W_in),
+                                                                    return_mode=return_mode,matching_strategy=matching_strategy,line_type=line_type,image_shape=(H_in,W_in),
                                                                     px_mul_x=px_mul_x,px_mul_y=px_mul_y,match_threshold=match_thresh_pixel,max_diagnoal=max_diagnoal)            
             #Update the epoch train metrics accumulator
             test_logger['loss'].append(loss.item())

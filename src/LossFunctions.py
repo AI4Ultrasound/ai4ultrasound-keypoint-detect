@@ -9,7 +9,7 @@ class KeypointLoss(nn.Module):
     SUPPORTED_MATCHING=('fixed', 'hungarian', 'heatmap')
     #############Init
     def __init__(self,loss_type,weights,device,
-                 sigmas=None,return_mode='frame',num_categories=2,heatmap_sigma=2.0,matching_strategy='heatmap'):
+                 sigmas=None,return_mode='frame',line_type='pleuraline',heatmap_sigma=2.0,matching_strategy='heatmap'):
         '''
         Inputs:
             - loss_type: supported loss functions:
@@ -24,7 +24,7 @@ class KeypointLoss(nn.Module):
             - return_mode: if we are estimating keypoints frame-by-frame (keypoints are (B,K_t), or at the clip level (keypoints are (B,T, K_t))
                 - 'frame' loss computed over B samples
                 - 'clip' loss computed over B*T samples
-            - num_categories: Number of keypoint categories.  Used only for heatmap mode (default 2).
+            - line_type: 'bline','pleuraline',or 'both'
             - heatmap_sigma: Gaussian σ in heatmap pixels for target generation. Used only for heatmap mode (default 2.0).
             - matching_strategy:
                 - 'fixed': pred[b,k] is already aligned to target[b,k] by index.
@@ -58,7 +58,7 @@ class KeypointLoss(nn.Module):
         self.loss_type=loss_type
         self.return_mode=return_mode
         self.matching_strategy=matching_strategy
-        self.num_categories=num_categories
+        self.line_type=line_type
         self.heatmap_sigma=heatmap_sigma
 
 
@@ -157,8 +157,12 @@ class KeypointLoss(nn.Module):
         target_weight    : (B, C)  float   1=channel active  0=no keypoints
         """
         weight = target_weight[:, :, None, None]   # (B, C, 1, 1) — broadcast
-
         if self.loss_type == 'L1':
+            # print("Heatmap Weight Shape: "+str(weight.shape))
+            print("Heatmap Weight: "+str(weight))
+            pred_target=torch.abs(pred-target_heatmaps).clone()
+            # print("pred-target_heatmaps shape: "+str(pred_target.shape))
+            # print("pred-target_heatmaps: "+str(pred_target[0,0,:,:]))
             loss= self.weights[0] * (
                 torch.abs(pred - target_heatmaps) * weight
             ).mean()
@@ -260,7 +264,7 @@ class KeypointLoss(nn.Module):
                 raise ValueError(
                     "(H_in, W_in) must be supplied for heatmap matching."
                 )
-            heatmaps, weight = utils.make_target_heatmaps(target, visibility, categories, H_out, W_out, H_in, W_in,self.num_categories,self.heatmap_sigma)
+            heatmaps, weight = utils.make_target_heatmaps(target, visibility, categories, H_out, W_out, H_in, W_in,self.line_type,self.heatmap_sigma)
             loss=self._compute_heatmap_loss(pred,heatmaps,weight)
             
             

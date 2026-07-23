@@ -155,8 +155,13 @@ if __name__=='__main__':
     valid_data.cast_stat_dicts_to_tensor_and_device(device)
 
     ######################Setup Dataloader##################
-    train_loader=DataLoader(dataset=train_data,batch_size=hyperparameters['batch_size'],shuffle=True,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn) #num_workers=0 works fastest
-    valid_loader=DataLoader(dataset=valid_data,batch_size=hyperparameters['batch_size'],shuffle=False,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn)
+    if hyperparameters['return_mode']=='frame': #Use the frame mode collate function
+        train_loader=DataLoader(dataset=train_data,batch_size=hyperparameters['batch_size'],shuffle=True,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn) #num_workers=0 works fastest
+        valid_loader=DataLoader(dataset=valid_data,batch_size=hyperparameters['batch_size'],shuffle=False,num_workers=0,pin_memory=True,collate_fn=utils.frame_collate_fn)
+    else:
+        train_loader=DataLoader(dataset=train_data,batch_size=hyperparameters['batch_size'],shuffle=True,num_workers=0,pin_memory=True,collate_fn=utils.clip_collate_fn_fullpad) #num_workers=0 works fastest
+        valid_loader=DataLoader(dataset=valid_data,batch_size=hyperparameters['batch_size'],shuffle=False,num_workers=0,pin_memory=True,collate_fn=utils.clip_collate_fn_fullpad)
+
 
     ##################Initialize model, optimizer and lr scheduler########
     #####Create model
@@ -220,7 +225,7 @@ if __name__=='__main__':
         device=device,
         sigmas=hyperparameters['sigmas'],
         return_mode=hyperparameters['return_mode'],
-        num_categories=num_categories,
+        line_type=hyperparameters['line_type'],
         heatmap_sigma=hyperparameters['heatmap_sigma'],
         matching_strategy=hyperparameters['matching_strategy'])
     
@@ -245,7 +250,8 @@ if __name__=='__main__':
         matching_strategy=hyperparameters['matching_strategy'],
         match_thresh_percentage=hyperparameters['match_thresh_percentage'],
         verbose=False,
-        metric_every_n_batches=hyperparameters['metric_every_n_batches'])
+        metric_every_n_batches=hyperparameters['metric_every_n_batches'],
+        line_type=hyperparameters['line_type'])
     
     #Run training
     train_obj.train()
@@ -268,7 +274,8 @@ if __name__=='__main__':
             device=device,
             us_framesize=hyperparameters['us_framesize'],
             model_name_save=model_name_save,
-            match_thresh_percentage=hyperparameters['match_thresh_percentage'])
+            match_thresh_percentage=hyperparameters['match_thresh_percentage'],
+            line_type=hyperparameters['line_type'])
 
     else:
         print('No checkpoint found at: '+checkpoint_path+ ' skipping testing...')
