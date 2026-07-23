@@ -133,23 +133,18 @@ class ModelTrainer(nn.Module):
                     target_categories=data['categories'].to(self.device,non_blocking=True)  #(B,K)
                     px_mul_x=data['px_mul_x'] #Multiplier for pixel to mm (mm=pixel*px_mul), size (B)
                     px_mul_y=data['px_mul_y']
-                    # print("Raw Image Shape: "+str(us_frames.shape))
-                    # print("Raw Target Keypoints Shape"+str(target_keypoints.shape))
-
+                    
                     #Gets prediction and runs the loss
                     if self.matching_strategy in ('fixed','hungarian'):
                         pred_keypoints,pred_categories=self.model(us_frames)
                         loss=self.loss_fun(pred_keypoints,target_keypoints,target_visibility,target_areas,target_categories,pred_categories=pred_categories)
                     elif self.matching_strategy=='heatmap':
                         pred_heatmaps=self.model(us_frames) #shape (B,2,H',W')
-                        # print("Pred Heatmaps Shape: "+str(pred_heatmaps.shape))
                         loss = self.loss_fun(
                         pred_heatmaps, target_keypoints,
                         target_visibility, target_areas, target_categories,
                         image_shape = (self.H_in,self.W_in),  
                         )
-                        loss_copy=loss.clone()
-                        print("Loss: "+str(loss_copy.item()))
 
                 elif self.return_mode=='clip': #Using the clip_collate_fn return where we pad the end of the time dimension with zeros
                     us_frames=data['images'].to(self.device,non_blocking=True) #(B,T, C, H, W)

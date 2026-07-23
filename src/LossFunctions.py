@@ -158,11 +158,6 @@ class KeypointLoss(nn.Module):
         """
         weight = target_weight[:, :, None, None]   # (B, C, 1, 1) — broadcast
         if self.loss_type == 'L1':
-            # print("Heatmap Weight Shape: "+str(weight.shape))
-            print("Heatmap Weight: "+str(weight))
-            pred_target=torch.abs(pred-target_heatmaps).clone()
-            # print("pred-target_heatmaps shape: "+str(pred_target.shape))
-            # print("pred-target_heatmaps: "+str(pred_target[0,0,:,:]))
             loss= self.weights[0] * (
                 torch.abs(pred - target_heatmaps) * weight
             ).mean()

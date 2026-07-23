@@ -54,7 +54,6 @@ if __name__=='__main__':
         'convert_to_gray': True,
         'img_augmentation': None,
         'aug_prob': 0.1,
-        'return_mode': 'frame',
 
         #Batch size and num epochs
         'batch_size': 32,
@@ -89,7 +88,11 @@ if __name__=='__main__':
 
     #Setup name of model to save
     model_name_save=f"{hyperparameters['base_model_name_save']}"
-    model_name_load=f"{hyperparameters['base_model_name_save']}"
+    model_name_load=f"{hyperparameters['base_model_name_load']}"
+
+    #Save the hyperparameters to the logs folder
+    with open(os.path.join('../logs', str(model_name_save), 'hyperparameters.json'),"w") as f:
+        json.dump(hyperparameters,f)
 
     ##############Random Seed##############
     torch.manual_seed(hyperparameters['random_state'])

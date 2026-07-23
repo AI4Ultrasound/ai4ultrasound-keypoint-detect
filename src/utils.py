@@ -1038,14 +1038,11 @@ def make_target_heatmaps(keypoints, visibility, categories, H_out, W_out, H_in, 
                                 dtype=torch.float32, device=device)
     
     vis_mask = visibility.bool() & (categories > 0)
-    print("vis_mask: "+str(vis_mask[0,:]))
 
     for cat_idx,cat_tag in enumerate(category_ids):
         # Boolean mask for keypoints belonging to this category: (B, K)
         cat_mask = vis_mask & (categories == cat_tag)
-        print("cat_mask: "+str(cat_mask[0,:]))
         if not cat_mask.any():
-            print("No cat_mask are true")
             continue
 
         # Broadcast: cx/cy (B,K,1,1) vs grid (1,1,H,W) → Gaussian (B,K,H,W)
